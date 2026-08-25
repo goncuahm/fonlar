@@ -1,5 +1,6 @@
-streamlit
-pandas
-numpy
-pytefas
-matplotlib
+streamlit>=1.60
+pytefas>=0.4.1
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+boto3>=1.34
