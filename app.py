@@ -8,17 +8,28 @@ data for the WHOLE fund universe in a single call:
 
 pytefas auto-chunks a long date range into ~28-day pieces internally and
 manages TEFAS's own rate limit for you (confirmed by inspecting the
-installed package) -- so 250 trading days is ~12-13 chunked requests
-under the hood, not 250 separate calls.
+installed package) -- so 200 trading days is ~10-11 chunked requests
+under the hood, not 200 separate calls.
 
-FETCH TIERS: the lookback slider allows 30-250 trading days in 5-day
-increments (44 possible positions) with a default of 125 for a faster
-first load. Fetching fresh data on every slider tick would be a bad
-experience, so instead there are exactly two cached fetch sizes --
-FETCH_TIERS = [125, 250] -- and the app always pulls the smallest tier
-that covers the current slider value. Every position from 30-125 shares
-one cached (faster) fetch; pushing past 125 triggers the larger 250-day
-fetch ONCE, then everything from 130-250 re-slices that instantly too.
+FETCH: always pulls the full MAX_LOOKBACK_TDAYS (200 trading days) window,
+regardless of where the lookback slider is set. This is a direct
+consequence of requiring every included fund to have at least
+MIN_HISTORY_TDAYS (200) days of history (see below) -- there's no way to
+verify a fund has 200 days of data without having fetched at least that
+much, so a "fetch only 125 days for speed" shortcut is no longer
+compatible with that requirement. The lookback slider is still free and
+instant to move (30-200, 5-day increments) since it only re-slices the
+already-fetched data -- it just means the FIRST load each session always
+takes roughly proportionally as long as MAX_LOOKBACK_TDAYS implies, not a
+faster 125-day path.
+
+MATURITY FILTER: a fund needs at least MIN_HISTORY_TDAYS (200) valid
+trading days of price history to be considered AT ALL, independent of
+the lookback slider. This is a fixed constant, not a UI control -- it's
+a data-quality/maturity floor, not something meant to be tuned away.
+Because MIN_HISTORY_TDAYS equals MAX_LOOKBACK_TDAYS, any fund that
+passes this gate automatically has enough history for ANY lookback
+selection up to 200 -- no partial/truncated windows are possible anymore.
 
 SCREENING: a fund needs enough investors AND to clear an annualized
 return floor (the "initial filter") over its own lookback window (up to
@@ -54,10 +65,16 @@ except ImportError:
 # ════════════════════════════════════════════════════════════════════
 #  CONFIG
 # ════════════════════════════════════════════════════════════════════
-MAX_LOOKBACK_TDAYS = 250
-FETCH_TIERS = [125, MAX_LOOKBACK_TDAYS]
-# Ordered ascending. fetch_universe() always pulls the SMALLEST tier
-# that covers the requested lookback -- see module docstring.
+MAX_LOOKBACK_TDAYS = 200
+# Also the fetch size, always -- see module docstring for why the tiered
+# fetch approach is no longer compatible with MIN_HISTORY_TDAYS below.
+
+MIN_HISTORY_TDAYS = 200
+# NEW: a fund must have at least this many valid trading days of price
+# history to be included AT ALL, regardless of the lookback slider.
+# Fixed on purpose, not a sidebar control -- this is a maturity/data-
+# quality floor ("don't show funds that haven't been around long
+# enough to trust"), not something meant to be dialed down.
 
 CACHE_TTL_HOURS = 12
 ANNUALIZATION = 252
@@ -77,25 +94,17 @@ def find_col(df, patterns):
     return None
 
 
-def fetch_tier_for(lookback_tdays):
-    for tier in FETCH_TIERS:
-        if lookback_tdays <= tier:
-            return tier
-    return FETCH_TIERS[-1]
-
-
 @st.cache_resource
 def get_crawler():
     return Crawler()
 
 
 @st.cache_data(ttl=CACHE_TTL_HOURS * 3600, show_spinner=False)
-def fetch_universe(kind, fetch_tier_tdays):
-    """The one expensive network call. Cached per (kind, fetch_tier) pair
-    -- with only 2 possible tiers, there are only ever 2 distinct fetches
-    per fund kind, no matter how much the lookback slider gets nudged."""
+def fetch_universe(kind, lookback_tdays):
+    """The one expensive network call -- always fetches the full
+    MAX_LOOKBACK_TDAYS window (see module docstring), cached per `kind`."""
     crawler = get_crawler()
-    calendar_days_back = int(fetch_tier_tdays * 1.55) + 20
+    calendar_days_back = int(lookback_tdays * 1.55) + 20
     end = date.today()
     start = end - timedelta(days=calendar_days_back)
     raw = crawler.fetch(start.isoformat(), end.isoformat(), kind=kind, columns="info")
@@ -115,16 +124,21 @@ def clean_bad_ticks(price_df):
     return clean, dropped
 
 
-def screen_funds(price_df, investor_snapshot, lookback_tdays, min_obs,
+def screen_funds(price_df, investor_snapshot, lookback_tdays, min_history_tdays,
                   min_ann_return, min_investors, risk_free, top_n):
     """Returns a DataFrame with one row per qualifying fund: return,
     vol, Sharpe, max drawdown, Calmar -- ranked by Sharpe descending."""
     daily_log_ret = np.log(price_df / price_df.shift(1))
     rows = []
     for code in price_df.columns:
-        s = daily_log_ret[code].dropna()
-        if len(s) < min_obs:
+        # NEW: check history in terms of PRICE observations, not the
+        # derived daily-return series -- returns are day-over-day diffs,
+        # so a fund with exactly N valid prices only has N-1 valid
+        # returns. Checking the return series' length here would
+        # silently require N+1 days of price data to pass, not N.
+        if price_df[code].notna().sum() < min_history_tdays:
             continue
+        s = daily_log_ret[code].dropna()
         window = s.iloc[-lookback_tdays:]
         n_obs = len(window)
         mean_daily = window.mean()
@@ -222,6 +236,8 @@ st.title("📊 TEFAS Fund Screener — Best Sharpe Ratio Funds")
 st.caption("Fetches fresh data on demand -- no database, no stored files. "
            f"Cached in memory for {CACHE_TTL_HOURS}h at a time so repeated "
            "interactions don't re-hit the network.")
+st.caption(f"ℹ️ Only funds with at least {MIN_HISTORY_TDAYS} trading days of "
+           f"price history are ever considered (fixed, not adjustable).")
 
 if Crawler is None:
     st.error("`pytefas` is not installed in this environment. Add it to requirements.txt.")
@@ -235,17 +251,12 @@ st.sidebar.header("Screening parameters")
 LOOKBACK_TDAYS = st.sidebar.slider(
     "Lookback window (trading days)", min_value=30, max_value=MAX_LOOKBACK_TDAYS,
     value=125, step=5,
-    help=f"Return/Sharpe computed over each fund's last N trading days "
-         f"(or fewer if that's all that's available). Defaults to 125 "
-         f"for a faster first load -- going above {FETCH_TIERS[0]} "
-         f"triggers one additional (slower) fetch up to {FETCH_TIERS[-1]}, "
-         f"then further slider movement in either range is instant."
-)
-MIN_OBS_FOR_SHARPE = st.sidebar.slider(
-    "Min days required to include a fund", min_value=20, max_value=MAX_LOOKBACK_TDAYS,
-    value=60, step=10,
-    help="Funds with fewer valid trading days than this are excluded "
-         "entirely, regardless of how good they look."
+    help=f"Return/Sharpe computed over each fund's last N trading days. "
+         f"Every fund shown already has at least {MIN_HISTORY_TDAYS} days of "
+         f"history (see the maturity filter above), so this is always a "
+         f"full, untruncated window -- and moving this slider is instant, "
+         f"it never re-fetches (the full {MAX_LOOKBACK_TDAYS}-day dataset "
+         f"is always fetched upfront)."
 )
 MIN_ANN_RETURN_PCT = st.sidebar.number_input(
     "Min annualized return (%) -- initial filter", min_value=-50.0, max_value=500.0,
@@ -261,19 +272,14 @@ RISK_FREE_RATE = st.sidebar.number_input(
     "Risk-free rate (annualized, %)", min_value=0.0, max_value=100.0, value=0.0, step=1.0
 ) / 100.0
 
-# safety clamp: never require more observations than the window itself asks for,
-# or nothing could ever pass when the slider is set below the min-obs floor
-effective_min_obs = min(MIN_OBS_FOR_SHARPE, LOOKBACK_TDAYS)
-
 col_a, col_b = st.columns([1, 4])
 if col_a.button("🔄 Refresh Data", help="Force a new fetch, bypassing the cache TTL."):
     fetch_universe.clear()
 
-fetch_tier = fetch_tier_for(LOOKBACK_TDAYS)
-with st.spinner(f"Fetching {fetch_tier} trading days of {KIND} fund data "
-                 f"-- first load at this tier can take a couple of minutes ..."):
+with st.spinner(f"Fetching {MAX_LOOKBACK_TDAYS} trading days of {KIND} fund data "
+                 f"-- this can take a couple of minutes ..."):
     try:
-        raw, fetched_at = fetch_universe(KIND, fetch_tier)
+        raw, fetched_at = fetch_universe(KIND, MAX_LOOKBACK_TDAYS)
     except TefasRateLimitError as e:
         st.error(f"TEFAS rate-limited this request: {e}. Wait a bit and try again.")
         st.stop()
@@ -285,7 +291,7 @@ with st.spinner(f"Fetching {fetch_tier} trading days of {KIND} fund data "
         st.stop()
 
 col_b.caption(f"Last fetched: {fetched_at.strftime('%Y-%m-%d %H:%M:%S')} "
-              f"(tier: {fetch_tier} trading days, cached up to {CACHE_TTL_HOURS}h)")
+              f"(cached up to {CACHE_TTL_HOURS}h)")
 
 if raw is None or raw.empty:
     st.error("No data returned. Try Refresh Data, or check back later.")
@@ -351,7 +357,7 @@ st.write(f"📂 Universe: **{price_df.shape[1]}** fund codes, **{price_df.shape[
          + (f" · dropped {len(dropped_funds)} fund(s) with unreliable price data" if dropped_funds else ""))
 
 results = screen_funds(
-    price_df, investor_snapshot, LOOKBACK_TDAYS, effective_min_obs,
+    price_df, investor_snapshot, LOOKBACK_TDAYS, MIN_HISTORY_TDAYS,
     MIN_ANN_RETURN_PCT / 100.0, MIN_INVESTOR_COUNT, RISK_FREE_RATE, TOP_N
 )
 
