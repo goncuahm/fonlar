@@ -1,40 +1,39 @@
 """
 TEFAS Fund Screener — fetch-on-the-fly Streamlit app (no database)
 
-ARCHITECTURE PIVOT from the earlier storage-backed version: no local disk,
-no S3, no retention/pruning, no daily-CSV files at all. Instead, on demand
-(or once per cache TTL), this fetches up to MAX_LOOKBACK_TDAYS (250) trading
-days of price/investor data for the WHOLE fund universe in a single call:
+No local disk, no S3, no daily-CSV files. On demand, this fetches trading
+data for the WHOLE fund universe in a single call:
 
     Crawler().fetch(start_date, end_date, kind="YAT", columns="info")
 
-pytefas automatically chunks a long date range into ~28-day pieces
-internally and manages TEFAS's own rate limit for you (confirmed by
-inspecting the installed package directly) -- so ~250 trading days is
-roughly 12-13 chunked requests, taking on the order of 2-3 minutes, not
-250 separate one-day calls. That's what makes "no database" practical.
+pytefas auto-chunks a long date range into ~28-day pieces internally and
+manages TEFAS's own rate limit for you (confirmed by inspecting the
+installed package) -- so 250 trading days is ~12-13 chunked requests
+under the hood, not 250 separate calls.
 
-CACHING: the expensive fetch is cached via st.cache_data with a TTL (see
-CACHE_TTL_HOURS) keyed only on fund `kind` -- so it always pulls the full
-MAX_LOOKBACK_TDAYS window regardless of what the lookback slider is set
-to. Adjusting the lookback slider, return threshold, investor-count
-filter, or TOP_N afterward is instant, because those just re-slice/
-re-filter the already-cached DataFrame rather than hitting the network
-again. A "Refresh Data" button lets you force a new fetch before the TTL
-expires.
+FETCH TIERS: the lookback slider allows 30-250 trading days in 5-day
+increments (44 possible positions) with a default of 125 for a faster
+first load. Fetching fresh data on every slider tick would be a bad
+experience, so instead there are exactly two cached fetch sizes --
+FETCH_TIERS = [125, 250] -- and the app always pulls the smallest tier
+that covers the current slider value. Every position from 30-125 shares
+one cached (faster) fetch; pushing past 125 triggers the larger 250-day
+fetch ONCE, then everything from 130-250 re-slices that instantly too.
 
-SCREENING LOGIC (single window, not multi-horizon like the earlier
-scripts): for each fund, take its last min(MAX_LOOKBACK_TDAYS, however
-many days are actually available) daily log returns -- "250 or fewer" as
-requested, with a MIN_OBS_FOR_SHARPE floor below which a fund is excluded
-outright (too little history for a meaningful Sharpe estimate). Compute
-annualized return and Sharpe ratio over that window. A fund must clear
-BOTH the minimum investor count AND the minimum annualized return
-threshold (the "initial filter") to be ranked at all; among survivors,
-rank by Sharpe descending and show the top N.
+SCREENING: a fund needs enough investors AND to clear an annualized
+return floor (the "initial filter") over its own lookback window (up to
+the slider value, or fewer days if that's all that's available -- subject
+to a minimum-days floor below which it's excluded outright) to be ranked
+at all. Survivors are ranked by Sharpe ratio.
+
+TOP-10 DEEP DIVE: independent of how many rows the main table shows,
+the top 10 by Sharpe get a scaled cumulative-price chart (all starting
+at 1.0), a money-flow table (1/5/10/20-day, as %-of-AUM using the
+shares-outstanding signal), and a return-stats table (Sharpe, max
+drawdown, Calmar, annualized return, annualized vol).
 
 Run with:  streamlit run tefas_streamlit_app.py
-Requirements: streamlit, pytefas, pandas, numpy
+Requirements: streamlit, pytefas, pandas, numpy, matplotlib
 """
 
 import re
@@ -42,6 +41,7 @@ from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
 
 try:
@@ -52,25 +52,21 @@ except ImportError:
 
 
 # ════════════════════════════════════════════════════════════════════
-#  CONFIG (fixed constants; the tunable ones are sidebar controls below)
+#  CONFIG
 # ════════════════════════════════════════════════════════════════════
 MAX_LOOKBACK_TDAYS = 250
-# Hard ceiling on how much history is ever fetched -- also the size of
-# the window the lookback slider can select from. Fetching is always
-# sized to cover this full amount regardless of the slider, so the
-# slider itself never triggers a re-fetch.
+FETCH_TIERS = [125, MAX_LOOKBACK_TDAYS]
+# Ordered ascending. fetch_universe() always pulls the SMALLEST tier
+# that covers the requested lookback -- see module docstring.
 
 CACHE_TTL_HOURS = 12
-# TEFAS publishes NAVs once per business day, so there's no point
-# re-fetching more often than this. "Refresh Data" below forces an
-# early refresh if you want it anyway.
-
 ANNUALIZATION = 252
 
-# ── Data-quality guards (same spirit as the backtest scripts) ─────────
 MAX_ABS_DAILY_RETURN = 0.30
 MAX_BAD_TICK_FRACTION = 0.05
 MAX_INTERP_GAP_TDAYS = 5
+
+FLOW_WINDOWS_TDAYS = [1, 5, 10, 20]
 
 
 def find_col(df, patterns):
@@ -81,18 +77,25 @@ def find_col(df, patterns):
     return None
 
 
+def fetch_tier_for(lookback_tdays):
+    for tier in FETCH_TIERS:
+        if lookback_tdays <= tier:
+            return tier
+    return FETCH_TIERS[-1]
+
+
 @st.cache_resource
 def get_crawler():
     return Crawler()
 
 
 @st.cache_data(ttl=CACHE_TTL_HOURS * 3600, show_spinner=False)
-def fetch_universe(kind, max_lookback_tdays):
-    """The one expensive network call. Cached by `kind` only (and an
-    implicit TTL) -- NOT by any of the screening/filter parameters, so
-    tweaking those afterward never re-triggers this."""
+def fetch_universe(kind, fetch_tier_tdays):
+    """The one expensive network call. Cached per (kind, fetch_tier) pair
+    -- with only 2 possible tiers, there are only ever 2 distinct fetches
+    per fund kind, no matter how much the lookback slider gets nudged."""
     crawler = get_crawler()
-    calendar_days_back = int(max_lookback_tdays * 1.55) + 20   # buffer for weekends/holidays
+    calendar_days_back = int(fetch_tier_tdays * 1.55) + 20
     end = date.today()
     start = end - timedelta(days=calendar_days_back)
     raw = crawler.fetch(start.isoformat(), end.isoformat(), kind=kind, columns="info")
@@ -100,9 +103,6 @@ def fetch_universe(kind, max_lookback_tdays):
 
 
 def clean_bad_ticks(price_df):
-    """Same logic as the backtest scripts: null out single-day moves
-    bigger than MAX_ABS_DAILY_RETURN, interpolate short gaps, drop funds
-    with too many bad ticks to trust. Returns (clean_df, dropped_funds)."""
     raw_ret = price_df.pct_change(fill_method=None)
     bad_tick = raw_ret.abs() > MAX_ABS_DAILY_RETURN
     bad_frac = bad_tick.sum() / raw_ret.notna().sum().replace(0, np.nan)
@@ -117,15 +117,15 @@ def clean_bad_ticks(price_df):
 
 def screen_funds(price_df, investor_snapshot, lookback_tdays, min_obs,
                   min_ann_return, min_investors, risk_free, top_n):
-    """The cheap, reactive part -- no network calls, just math on the
-    already-fetched (and cached) price matrix."""
+    """Returns a DataFrame with one row per qualifying fund: return,
+    vol, Sharpe, max drawdown, Calmar -- ranked by Sharpe descending."""
     daily_log_ret = np.log(price_df / price_df.shift(1))
     rows = []
     for code in price_df.columns:
         s = daily_log_ret[code].dropna()
         if len(s) < min_obs:
             continue
-        window = s.iloc[-lookback_tdays:]   # last <=lookback_tdays observations
+        window = s.iloc[-lookback_tdays:]
         n_obs = len(window)
         mean_daily = window.mean()
         std_daily = window.std(ddof=1)
@@ -143,6 +143,10 @@ def screen_funds(price_df, investor_snapshot, lookback_tdays, min_obs,
         if investors < min_investors:
             continue
 
+        nav = np.exp(window.cumsum())
+        max_dd = (nav / nav.cummax() - 1).min()
+        calmar = (ann_ret / abs(max_dd)) if max_dd < 0 else np.nan
+
         rows.append({
             "fund_code": code,
             "n_days_used": n_obs,
@@ -150,6 +154,8 @@ def screen_funds(price_df, investor_snapshot, lookback_tdays, min_obs,
             "ann_return_%": round(ann_ret * 100, 2),
             "ann_vol_%": round(ann_vol * 100, 2),
             "sharpe": round(sharpe, 3),
+            "max_drawdown_%": round(max_dd * 100, 2),
+            "calmar": round(calmar, 3) if pd.notna(calmar) else None,
             "investors": investors,
         })
 
@@ -157,6 +163,55 @@ def screen_funds(price_df, investor_snapshot, lookback_tdays, min_obs,
     if result.empty:
         return result
     return result.sort_values("sharpe", ascending=False).head(top_n).reset_index(drop=True)
+
+
+def money_flow_table(price_df, shares_df, fund_codes, windows_tdays):
+    """Daily flow = Δshares_outstanding * price (independent of price
+    moves -- the cleanest signal, same convention as the backtest
+    scripts), normalized to %-of-prior-day-AUM, then SUMMED over each
+    window (not averaged) since these are different-length snapshots,
+    not one rolling figure."""
+    codes = [c for c in fund_codes if c in shares_df.columns and c in price_df.columns]
+    if not codes:
+        return pd.DataFrame()
+
+    shares = shares_df[codes]
+    price = price_df[codes]
+    daily_flow = shares.diff() * price
+    prior_aum = shares.shift(1) * price.shift(1)
+    flow_pct = daily_flow / prior_aum.replace(0, np.nan)
+
+    rows = []
+    for code in codes:
+        s = flow_pct[code].dropna()
+        row = {"fund_code": code}
+        for w in windows_tdays:
+            window = s.iloc[-w:]
+            row[f"flow_{w}d_%"] = round(window.sum() * 100, 2) if len(window) else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def plot_scaled_prices(price_df, fund_codes, lookback_tdays, title):
+    codes = [c for c in fund_codes if c in price_df.columns]
+    window_prices = price_df[codes].iloc[-lookback_tdays:]
+    first_valid = window_prices.apply(lambda s: s.dropna().iloc[0] if s.notna().any() else np.nan)
+    scaled = window_prices.div(first_valid)
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    cmap = plt.cm.tab10
+    for idx, code in enumerate(codes):
+        s = scaled[code].dropna()
+        ax.plot(s.index, s.values, lw=1.8, alpha=0.9, color=cmap(idx % 10), label=code)
+
+    ax.axhline(1.0, color="black", lw=0.8, linestyle="--", alpha=0.35)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative scaled price (start = 1.0)")
+    ax.legend(loc="upper left", fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    return fig
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -179,47 +234,46 @@ KIND = st.sidebar.selectbox("Fund kind", ["YAT", "EMK", "BYF"], index=0,
 st.sidebar.header("Screening parameters")
 LOOKBACK_TDAYS = st.sidebar.slider(
     "Lookback window (trading days)", min_value=30, max_value=MAX_LOOKBACK_TDAYS,
-    value=MAX_LOOKBACK_TDAYS, step=10,
-    help="Return and Sharpe are computed over each fund's last N trading "
-         "days -- or however many are actually available if fewer than N "
-         "(see 'Min days required' below for the cutoff on how few is too "
-         "few to trust). Adjusting this doesn't re-fetch anything, it just "
-         "re-slices the already-fetched data."
+    value=125, step=5,
+    help=f"Return/Sharpe computed over each fund's last N trading days "
+         f"(or fewer if that's all that's available). Defaults to 125 "
+         f"for a faster first load -- going above {FETCH_TIERS[0]} "
+         f"triggers one additional (slower) fetch up to {FETCH_TIERS[-1]}, "
+         f"then further slider movement in either range is instant."
 )
 MIN_OBS_FOR_SHARPE = st.sidebar.slider(
     "Min days required to include a fund", min_value=20, max_value=MAX_LOOKBACK_TDAYS,
     value=60, step=10,
     help="Funds with fewer valid trading days than this are excluded "
-         "entirely -- too little history for a meaningful Sharpe estimate, "
-         "regardless of how good it looks."
+         "entirely, regardless of how good they look."
 )
 MIN_ANN_RETURN_PCT = st.sidebar.number_input(
     "Min annualized return (%) -- initial filter", min_value=-50.0, max_value=500.0,
-    value=40.0, step=5.0,
+    value=60.0, step=5.0,
     help="A fund must clear this annualized-return bar over its lookback "
-         "window to be considered at all. Annualized (not raw total "
-         "return) so funds with less than the full lookback available are "
-         "compared fairly against funds with a full window."
+         "window to be considered at all."
 )
 MIN_INVESTOR_COUNT = st.sidebar.number_input(
     "Min investor count", min_value=0, max_value=100000, value=200, step=50
 )
-TOP_N = st.sidebar.number_input("Funds to show", min_value=5, max_value=200, value=50, step=5)
+TOP_N = st.sidebar.number_input("Funds to show in main table", min_value=5, max_value=200, value=50, step=5)
 RISK_FREE_RATE = st.sidebar.number_input(
-    "Risk-free rate (annualized, %)", min_value=0.0, max_value=100.0, value=0.0, step=1.0,
-    help="Subtracted from annualized return in the Sharpe numerator. Set "
-         "to your actual TRY risk-free rate if you want a proper excess-return Sharpe."
+    "Risk-free rate (annualized, %)", min_value=0.0, max_value=100.0, value=0.0, step=1.0
 ) / 100.0
 
+# safety clamp: never require more observations than the window itself asks for,
+# or nothing could ever pass when the slider is set below the min-obs floor
+effective_min_obs = min(MIN_OBS_FOR_SHARPE, LOOKBACK_TDAYS)
+
 col_a, col_b = st.columns([1, 4])
-refresh = col_a.button("🔄 Refresh Data", help="Force a new fetch, bypassing the cache TTL.")
-if refresh:
+if col_a.button("🔄 Refresh Data", help="Force a new fetch, bypassing the cache TTL."):
     fetch_universe.clear()
 
-with st.spinner(f"Fetching up to {MAX_LOOKBACK_TDAYS} trading days of {KIND} fund data "
-                 f"-- first load can take a couple of minutes ..."):
+fetch_tier = fetch_tier_for(LOOKBACK_TDAYS)
+with st.spinner(f"Fetching {fetch_tier} trading days of {KIND} fund data "
+                 f"-- first load at this tier can take a couple of minutes ..."):
     try:
-        raw, fetched_at = fetch_universe(KIND, MAX_LOOKBACK_TDAYS)
+        raw, fetched_at = fetch_universe(KIND, fetch_tier)
     except TefasRateLimitError as e:
         st.error(f"TEFAS rate-limited this request: {e}. Wait a bit and try again.")
         st.stop()
@@ -231,19 +285,17 @@ with st.spinner(f"Fetching up to {MAX_LOOKBACK_TDAYS} trading days of {KIND} fun
         st.stop()
 
 col_b.caption(f"Last fetched: {fetched_at.strftime('%Y-%m-%d %H:%M:%S')} "
-              f"(cached up to {CACHE_TTL_HOURS}h)")
+              f"(tier: {fetch_tier} trading days, cached up to {CACHE_TTL_HOURS}h)")
 
 if raw is None or raw.empty:
     st.error("No data returned. Try Refresh Data, or check back later.")
     st.stop()
 
-# ── Detect columns defensively (pytefas's own docs list these as fixed
-# names, but a light regex check costs nothing and protects against a
-# future schema tweak) ─────────────────────────────────────────────
 date_col = find_col(raw, [r'^date$'])
 code_col = find_col(raw, [r'fund_code'])
 price_col = find_col(raw, [r'^price$'])
 investor_col = find_col(raw, [r'investor_count'])
+shares_col = find_col(raw, [r'shares_outstanding'])
 
 missing = [(l, c) for l, c in [("date", date_col), ("code", code_col), ("price", price_col)] if c is None]
 if missing:
@@ -257,6 +309,8 @@ raw[code_col] = raw[code_col].astype(str).str.strip().str.upper()
 raw = raw.dropna(subset=[date_col, price_col])
 if investor_col:
     raw[investor_col] = pd.to_numeric(raw[investor_col], errors="coerce")
+if shares_col:
+    raw[shares_col] = pd.to_numeric(raw[shares_col], errors="coerce")
 
 price_df = (raw[[date_col, code_col, price_col]]
             .drop_duplicates(subset=[date_col, code_col], keep="last")
@@ -264,6 +318,18 @@ price_df = (raw[[date_col, code_col, price_col]]
             .sort_index())
 price_df.index = pd.to_datetime(price_df.index)
 price_df.columns.name = None
+
+shares_df = None
+if shares_col:
+    shares_df = (raw[[date_col, code_col, shares_col]]
+                 .drop_duplicates(subset=[date_col, code_col], keep="last")
+                 .pivot(index=date_col, columns=code_col, values=shares_col)
+                 .sort_index()
+                 .reindex(columns=price_df.columns))
+    shares_df.index = pd.to_datetime(shares_df.index)
+    shares_df.columns.name = None
+else:
+    st.info("No shares_outstanding column detected -- money-flow table will be skipped.")
 
 investor_snapshot = pd.Series(dtype=float)
 if investor_col:
@@ -285,7 +351,7 @@ st.write(f"📂 Universe: **{price_df.shape[1]}** fund codes, **{price_df.shape[
          + (f" · dropped {len(dropped_funds)} fund(s) with unreliable price data" if dropped_funds else ""))
 
 results = screen_funds(
-    price_df, investor_snapshot, LOOKBACK_TDAYS, MIN_OBS_FOR_SHARPE,
+    price_df, investor_snapshot, LOOKBACK_TDAYS, effective_min_obs,
     MIN_ANN_RETURN_PCT / 100.0, MIN_INVESTOR_COUNT, RISK_FREE_RATE, TOP_N
 )
 
@@ -300,3 +366,29 @@ st.caption(f"Window: up to {LOOKBACK_TDAYS} trading days | "
            f"min annualized return ≥{MIN_ANN_RETURN_PCT:.1f}% | "
            f"min investors ≥{MIN_INVESTOR_COUNT}")
 st.dataframe(results, width="stretch", hide_index=True)
+
+# ── Top-10 deep dive ────────────────────────────────────────────────
+top10 = results.head(10)
+top10_codes = top10["fund_code"].tolist()
+
+st.divider()
+st.subheader(f"🔍 Top {len(top10)} deep dive")
+
+st.pyplot(plot_scaled_prices(
+    price_df, top10_codes, LOOKBACK_TDAYS,
+    f"Top {len(top10)} funds by Sharpe — cumulative scaled price "
+    f"(last {LOOKBACK_TDAYS} trading days, start = 1.0)"
+))
+
+st.markdown("**Money flow (% of prior-day AUM, summed over each window)**")
+if shares_df is not None:
+    flow_df = money_flow_table(price_df, shares_df, top10_codes, FLOW_WINDOWS_TDAYS)
+    st.dataframe(flow_df, width="stretch", hide_index=True)
+else:
+    st.caption("Skipped -- no shares_outstanding data available this fetch.")
+
+st.markdown("**Return stats**")
+st.dataframe(
+    top10[["fund_code", "sharpe", "max_drawdown_%", "calmar", "ann_return_%", "ann_vol_%"]],
+    width="stretch", hide_index=True
+)
