@@ -1,0 +1,18 @@
+# TEFAS daily data cache -- never commit this. It grows continuously and
+# is meant to be rebuilt locally via the "Update Data" tab, not stored in
+# version control. If you point DATA_FOLDER elsewhere, add that path too.
+tefas_data/
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS junk
+.DS_Store
