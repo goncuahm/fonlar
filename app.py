@@ -2,27 +2,42 @@
 TEFAS Fund Screener — Streamlit app
 Port of the Colab "Part 1: update dataset / Part 2: screen & rank" script.
 
+STORAGE BACKENDS (new):
+  Local disk works fine for running this yourself or on your own server.
+  On Streamlit Community Cloud specifically, the filesystem is EPHEMERAL --
+  it does not survive app restarts, redeploys, or the sleep/wake cycle free
+  apps go through. So if you're deploying there, pick the "S3-compatible
+  bucket" backend instead (works with AWS S3, Cloudflare R2, Backblaze B2,
+  MinIO, or anything else that speaks the S3 API via boto3). Configure
+  credentials via st.secrets (see the sample secrets.toml in the sidebar
+  help text) rather than typing them into the UI in production.
+
+  Both backends implement the same tiny interface (list_files_with_sizes,
+  exists, read_csv, write_csv, delete_files), so every other part of this
+  app -- the fetch loop, the retention/pruning logic, the screener's
+  loading and ranking -- is completely unaware of which one is active.
+
 Key differences from the Colab version:
-  - No Google Drive mount -- point DATA_FOLDER at any local folder (sidebar).
   - Part 1 (incremental daily CSV backfill) becomes a button: click
     "Update Dataset" and it fetches missing trading days one by one with
     a live progress bar + log, instead of running unattended in a cell.
   - Because the fetch loop is a genuine blocking loop (rate-limited with
-    time.sleep between requests, same as the original), a single click
-    could otherwise block the browser for a very long time if many days
-    are missing (e.g. a 215-day bootstrap at 20s/day is over an hour).
-    A "max days per click" cap lets you backfill incrementally across
-    several clicks instead -- see MAX_DAYS_PER_RUN in the Update tab.
+    time.sleep between requests, same as the original), a "max days per
+    click" cap lets you backfill incrementally across several clicks
+    instead of blocking the browser for a very long time.
+  - A rolling retention window auto-prunes files older than N years so
+    storage doesn't grow without bound (see the Update Data tab).
   - Part 2 (screen & rank) is reactive: adjusting the threshold/TOP_N/
     investor-count controls re-filters and re-ranks instantly, because
-    the (comparatively expensive) CSV load+clean step is cached
-    separately via st.cache_data and only re-runs when the on-disk file
-    list actually changes.
+    the (comparatively expensive) load+clean step is cached separately
+    via st.cache_data and only re-runs when the file list actually changes.
 
 Run with:  streamlit run tefas_streamlit_app.py
-Requirements: streamlit, pytefas, pandas, numpy, matplotlib
+Requirements: streamlit, pytefas, pandas, numpy, matplotlib, boto3 (only
+              needed if you use the S3-compatible backend)
 """
 
+import io
 import os
 import re
 import time
@@ -38,6 +53,22 @@ try:
     from pytefas import Crawler
 except ImportError:
     Crawler = None
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError, BotoCoreError
+except ImportError:
+    boto3 = None
+    ClientError = BotoCoreError = Exception
+
+
+def safe_secrets(section):
+    """st.secrets raises if no secrets.toml exists at all (common in local
+    dev) -- swallow that and just return {} instead of crashing the app."""
+    try:
+        return dict(st.secrets.get(section, {}))
+    except Exception:
+        return {}
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -101,25 +132,6 @@ def get_crawler():
     return Crawler()
 
 
-def list_existing_files(data_folder):
-    if not os.path.isdir(data_folder):
-        return []
-    return sorted([
-        f for f in os.listdir(data_folder)
-        if f.startswith("tefas_daily_") and f.endswith(".csv")
-    ])
-
-
-def folder_size_bytes(data_folder, files):
-    total = 0
-    for f in files:
-        try:
-            total += os.path.getsize(os.path.join(data_folder, f))
-        except OSError:
-            pass
-    return total
-
-
 def human_size(n_bytes):
     for unit in ["B", "KB", "MB", "GB"]:
         if n_bytes < 1024:
@@ -128,24 +140,170 @@ def human_size(n_bytes):
     return f"{n_bytes:.1f} TB"
 
 
-def files_older_than(data_folder, files, retention_years):
-    """Daily files whose DATE (from the filename) is older than the
-    rolling retention window, oldest-first."""
+def files_older_than(files, retention_years):
+    """Daily filenames whose DATE (embedded in the name) is older than the
+    rolling retention window, oldest-first. Pure string/date logic --
+    doesn't touch storage, works the same for either backend."""
     cutoff = date.today() - timedelta(days=int(retention_years * 365.25))
     old = [f for f in files if date.fromisoformat(f[12:22]) < cutoff]
     return sorted(old)   # filenames sort chronologically since they embed ISO dates
 
 
-def prune_old_files(data_folder, files_to_remove):
-    """Deletes the given files from data_folder. Returns (removed, failed)."""
-    removed, failed = [], []
-    for f in files_to_remove:
+class StorageError(Exception):
+    """Raised for backend-level failures (bad credentials, unreachable
+    bucket, etc.) -- surfaced as a clean st.error() instead of a traceback."""
+    pass
+
+
+# ════════════════════════════════════════════════════════════════════
+#  STORAGE BACKENDS
+# ════════════════════════════════════════════════════════════════════
+class StorageBackend:
+    """Common interface -- the rest of the app only ever talks to this,
+    never to os.* or boto3 directly."""
+
+    def list_files_with_sizes(self):
+        """-> {filename: size_bytes} for every tefas_daily_*.csv file."""
+        raise NotImplementedError
+
+    def exists(self, filename):
+        raise NotImplementedError
+
+    def read_csv(self, filename):
+        raise NotImplementedError
+
+    def write_csv(self, filename, df):
+        raise NotImplementedError
+
+    def delete_files(self, filenames):
+        """-> (removed: list[str], failed: list[(str, str)])"""
+        raise NotImplementedError
+
+
+class LocalStorage(StorageBackend):
+    def __init__(self, folder):
+        self.folder = folder
+        os.makedirs(folder, exist_ok=True)
+
+    def _path(self, filename):
+        return os.path.join(self.folder, filename)
+
+    def list_files_with_sizes(self):
+        result = {}
+        for f in os.listdir(self.folder):
+            if f.startswith("tefas_daily_") and f.endswith(".csv"):
+                try:
+                    result[f] = os.path.getsize(self._path(f))
+                except OSError:
+                    result[f] = 0
+        return result
+
+    def exists(self, filename):
+        return os.path.exists(self._path(filename))
+
+    def read_csv(self, filename):
+        return pd.read_csv(self._path(filename), encoding="utf-8-sig", low_memory=False)
+
+    def write_csv(self, filename, df):
+        df.to_csv(self._path(filename), index=False, encoding="utf-8-sig")
+
+    def delete_files(self, filenames):
+        removed, failed = [], []
+        for f in filenames:
+            try:
+                os.remove(self._path(f))
+                removed.append(f)
+            except OSError as e:
+                failed.append((f, str(e)))
+        return removed, failed
+
+
+class S3Storage(StorageBackend):
+    def __init__(self, bucket, prefix="", region_name=None, endpoint_url=None,
+                 access_key_id=None, secret_access_key=None):
+        if boto3 is None:
+            raise StorageError("boto3 is not installed -- add it to requirements.txt "
+                                "to use the S3-compatible backend.")
+        self.bucket = bucket
+        self.prefix = (prefix.rstrip("/") + "/") if prefix else ""
+        client_kwargs = {}
+        if region_name:
+            client_kwargs["region_name"] = region_name
+        if endpoint_url:
+            client_kwargs["endpoint_url"] = endpoint_url
+        if access_key_id and secret_access_key:
+            client_kwargs["aws_access_key_id"] = access_key_id
+            client_kwargs["aws_secret_access_key"] = secret_access_key
         try:
-            os.remove(os.path.join(data_folder, f))
-            removed.append(f)
-        except OSError as e:
-            failed.append((f, str(e)))
-    return removed, failed
+            self.client = boto3.client("s3", **client_kwargs)
+        except (ClientError, BotoCoreError, ValueError) as e:
+            raise StorageError(f"Could not create S3 client: {e}")
+
+    def _key(self, filename):
+        return f"{self.prefix}{filename}"
+
+    def list_files_with_sizes(self):
+        result = {}
+        try:
+            paginator = self.client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket,
+                                            Prefix=self.prefix + "tefas_daily_"):
+                for obj in page.get("Contents", []):
+                    filename = obj["Key"][len(self.prefix):]
+                    if filename.endswith(".csv"):
+                        result[filename] = obj["Size"]
+        except (ClientError, BotoCoreError) as e:
+            raise StorageError(f"Could not list bucket contents: {e}")
+        return result
+
+    def exists(self, filename):
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=self._key(filename))
+            return True
+        except ClientError:
+            return False
+        except BotoCoreError as e:
+            raise StorageError(f"Could not check for {filename}: {e}")
+
+    def read_csv(self, filename):
+        try:
+            obj = self.client.get_object(Bucket=self.bucket, Key=self._key(filename))
+            body = obj["Body"].read()
+        except (ClientError, BotoCoreError) as e:
+            raise StorageError(f"Could not read {filename}: {e}")
+        return pd.read_csv(io.BytesIO(body), encoding="utf-8-sig", low_memory=False)
+
+    def write_csv(self, filename, df):
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        try:
+            self.client.put_object(Bucket=self.bucket, Key=self._key(filename), Body=csv_bytes)
+        except (ClientError, BotoCoreError) as e:
+            raise StorageError(f"Could not write {filename}: {e}")
+
+    def delete_files(self, filenames):
+        removed, failed = [], []
+        keys = [self._key(f) for f in filenames]
+        # S3 batch delete accepts up to 1000 keys per call
+        for i in range(0, len(keys), 1000):
+            batch_files = filenames[i:i + 1000]
+            batch_keys = keys[i:i + 1000]
+            try:
+                resp = self.client.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={"Objects": [{"Key": k} for k in batch_keys]}
+                )
+                deleted_keys = {d["Key"] for d in resp.get("Deleted", [])}
+                error_keys = {e["Key"]: e.get("Message", "unknown error")
+                              for e in resp.get("Errors", [])}
+                for f, k in zip(batch_files, batch_keys):
+                    if k in deleted_keys:
+                        removed.append(f)
+                    else:
+                        failed.append((f, error_keys.get(k, "not confirmed deleted")))
+            except (ClientError, BotoCoreError) as e:
+                for f in batch_files:
+                    failed.append((f, str(e)))
+        return removed, failed
 
 
 HORIZONS_TDAYS = {"1m": 21, "2m": 42, "3m": 63, "4m": 84, "5m": 105, "6m": 126}
@@ -165,20 +323,71 @@ st.set_page_config(page_title="TEFAS Fund Screener", layout="wide")
 st.title("📊 TEFAS Fund Screener")
 
 st.sidebar.header("Configuration")
-DATA_FOLDER = st.sidebar.text_input(
-    "Local data folder", value="./tefas_data/",
-    help="Any local folder -- there's no Google Drive mount here. "
-         "If you're running this inside Colab with Drive already mounted, "
-         "you can point this at /content/drive/MyDrive/Tefas/data/ instead."
-)
 KIND = st.sidebar.selectbox("Fund kind", ["YAT", "EMK", "BYF"], index=0,
                              help="YAT=mutual funds, EMK=pension, BYF=ETF")
-os.makedirs(DATA_FOLDER, exist_ok=True)
+
+st.sidebar.subheader("Storage backend")
+BACKEND_CHOICE = st.sidebar.radio(
+    "Where the daily CSVs live", ["Local folder", "S3-compatible bucket"], index=0,
+    help="Local folder is fine for running this yourself or on your own "
+         "server with a persistent disk. On Streamlit Community Cloud the "
+         "filesystem is ephemeral and does NOT survive restarts/redeploys "
+         "-- use S3-compatible storage there instead (AWS S3, Cloudflare "
+         "R2, Backblaze B2, MinIO, etc. -- anything boto3 can talk to)."
+)
+
+storage = None
+storage_cache_key = "unset"
+
+if BACKEND_CHOICE == "Local folder":
+    DATA_FOLDER = st.sidebar.text_input("Local data folder", value="./tefas_data/")
+    storage = LocalStorage(DATA_FOLDER)
+    storage_cache_key = f"local:{DATA_FOLDER}"
+else:
+    if boto3 is None:
+        st.sidebar.error("`boto3` is not installed in this environment. "
+                          "Add it to requirements.txt to use S3-compatible storage.")
+    s3_secrets = safe_secrets("s3")
+    with st.sidebar.expander("S3 settings", expanded=(not s3_secrets)):
+        st.caption(
+            "Prefer setting these via **st.secrets** in production (Streamlit "
+            "Cloud: Settings → Secrets) rather than typing them here:\n\n"
+            "```toml\n[s3]\nbucket = \"your-bucket\"\nprefix = \"tefas/\"\n"
+            "region = \"auto\"\nendpoint_url = \"\"  # blank for AWS S3\n"
+            "access_key_id = \"...\"\nsecret_access_key = \"...\"\n```"
+        )
+        bucket = st.text_input("Bucket name", value=s3_secrets.get("bucket", ""))
+        prefix = st.text_input("Key prefix", value=s3_secrets.get("prefix", "tefas/"))
+        region = st.text_input("Region (optional)", value=s3_secrets.get("region", ""))
+        endpoint_url = st.text_input(
+            "Custom endpoint URL (blank for AWS S3; needed for R2/B2/MinIO)",
+            value=s3_secrets.get("endpoint_url", "")
+        )
+        access_key_id = s3_secrets.get("access_key_id") or st.text_input(
+            "Access key ID", type="password")
+        secret_access_key = s3_secrets.get("secret_access_key") or st.text_input(
+            "Secret access key", type="password")
+
+    if not (bucket and access_key_id and secret_access_key):
+        st.sidebar.warning("Fill in bucket + credentials above (or via "
+                            "st.secrets) to enable S3 storage.")
+    else:
+        try:
+            storage = S3Storage(bucket=bucket, prefix=prefix, region_name=region or None,
+                                 endpoint_url=endpoint_url or None,
+                                 access_key_id=access_key_id, secret_access_key=secret_access_key)
+            storage_cache_key = f"s3:{bucket}:{prefix}"
+        except StorageError as e:
+            st.sidebar.error(f"Could not connect: {e}")
 
 if Crawler is None:
     st.sidebar.error("`pytefas` is not installed in this environment. "
                       "Add it to requirements.txt to enable data fetching. "
-                      "The Screener tab still works on data already on disk.")
+                      "The Screener tab still works on data already stored.")
+
+if storage is None:
+    st.warning("Configure a storage backend in the sidebar to continue.")
+    st.stop()
 
 tab_update, tab_screen = st.tabs(["📥 Update Data", "🏆 Screener"])
 
@@ -191,10 +400,10 @@ with tab_update:
     r1, r2, r3 = st.columns(3)
     RETENTION_YEARS = r1.number_input(
         "Keep last N years of data", min_value=0.5, max_value=10.0, value=3.0, step=0.5,
-        help="Daily files older than this rolling window get pruned so the "
-             "on-disk dataset doesn't grow without bound. Set generously if "
-             "you're not sure -- pruning only ever happens when you click "
-             "Update Dataset or Prune Now below, never automatically on page load."
+        help="Files older than this rolling window get pruned so storage "
+             "doesn't grow without bound. Pruning only ever happens when "
+             "you click Update Dataset or Prune Now below, never "
+             "automatically on page load."
     )
     MAX_DAYS_PER_RUN = r2.number_input(
         "Max days to fetch per click", min_value=1, max_value=500, value=10,
@@ -202,7 +411,7 @@ with tab_update:
              "RATE_LIMIT_PAUSE seconds/day, 10 days ≈ 3-4 minutes). If more "
              "days are missing than this, click Update again afterward to "
              "keep backfilling -- it always resumes from the last date "
-             "actually on disk, so nothing is skipped."
+             "actually stored, so nothing is skipped."
     )
     ENABLE_AUTO_PRUNE = r3.checkbox(
         "Auto-prune on each update", value=True,
@@ -213,7 +422,8 @@ with tab_update:
     RATE_LIMIT_PAUSE = st.slider(
         "Seconds between requests", 5, 60, 20,
         help="Same purpose as the original script's RATE_LIMIT_PAUSE -- "
-             "too low risks TEFAS rate-limiting or blocking requests."
+             "too low risks TEFAS rate-limiting or blocking requests "
+             "(TEFAS's own API applies a ~6 requests/minute limit)."
     )
     also_attempt_today = st.checkbox(
         "Also attempt today's same-day fetch after backfill", value=True,
@@ -223,9 +433,15 @@ with tab_update:
     )
 
     st.divider()
-    st.subheader("Local dataset status")
+    st.subheader("Dataset status")
 
-    existing_files = list_existing_files(DATA_FOLDER)
+    try:
+        files_with_sizes = storage.list_files_with_sizes()
+    except StorageError as e:
+        st.error(f"Could not read from storage: {e}")
+        st.stop()
+
+    existing_files = sorted(files_with_sizes.keys())
     today = date.today()
     today_str = today.strftime("%Y-%m-%d")
     yesterday = last_trading_day()   # guaranteed-safe ceiling for backfill
@@ -243,24 +459,24 @@ with tab_update:
         d for d in all_weekdays_between(fetch_from, yesterday)
         if d.strftime("%Y-%m-%d") not in existing_dates
     ]
-    today_file = os.path.join(DATA_FOLDER, f"tefas_daily_{today_str}.csv")
-    today_exists = os.path.exists(today_file)
+    today_file = f"tefas_daily_{today_str}.csv"
+    today_exists = today_file in existing_dates or storage.exists(today_file)
 
-    disk_bytes = folder_size_bytes(DATA_FOLDER, existing_files)
-    prune_preview = files_older_than(DATA_FOLDER, existing_files, RETENTION_YEARS)
+    disk_bytes = sum(files_with_sizes.values())
+    prune_preview = files_older_than(existing_files, RETENTION_YEARS)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Files on disk", len(existing_files))
-    c2.metric("Last date on disk", last_on_disk.isoformat() if last_on_disk else "—")
+    c1.metric("Files stored", len(existing_files))
+    c2.metric("Last date stored", last_on_disk.isoformat() if last_on_disk else "—")
     c3.metric("Missing trading days", len(missing_days))
     c4.metric("Today's file", "✅ saved" if today_exists else "not yet")
 
     c5, c6 = st.columns(2)
-    c5.metric("Disk usage", human_size(disk_bytes))
+    c5.metric("Storage used", human_size(disk_bytes))
     c6.metric(f"Older than {RETENTION_YEARS:g}y (prunable)", len(prune_preview))
 
     if not existing_files:
-        st.info(f"No data on disk yet — the first update will bootstrap "
+        st.info(f"Nothing stored yet — the first update will bootstrap "
                  f"~7 months of history ({fetch_from} → {yesterday}).")
     elif prune_preview:
         st.caption(f"Oldest prunable file: {prune_preview[0][12:22]} · "
@@ -273,6 +489,7 @@ with tab_update:
         remaining_after = len(missing_days) - len(days_to_fetch)
 
         saved, still_failed = [], []
+        storage_errors = []
 
         if days_to_fetch:
             st.write(f"Fetching {len(days_to_fetch)} day(s) "
@@ -283,7 +500,7 @@ with tab_update:
 
             for i, day in enumerate(days_to_fetch):
                 day_str = day.strftime("%Y-%m-%d")
-                out_path = os.path.join(DATA_FOLDER, f"tefas_daily_{day_str}.csv")
+                filename = f"tefas_daily_{day_str}.csv"
                 df_day, err = fetch_one_day(crawler, day_str, KIND)
                 if err:
                     log_box.write(f"⚠️ {day_str}: {err}")
@@ -291,9 +508,13 @@ with tab_update:
                 elif df_day is None:
                     log_box.write(f"⏭️ {day_str}: no data (holiday?)")
                 else:
-                    df_day.to_csv(out_path, index=False, encoding="utf-8-sig")
-                    saved.append(day_str)
-                    log_box.write(f"✅ {day_str}: {len(df_day):,} funds")
+                    try:
+                        storage.write_csv(filename, df_day)
+                        saved.append(day_str)
+                        log_box.write(f"✅ {day_str}: {len(df_day):,} funds")
+                    except StorageError as se:
+                        log_box.write(f"❌ {day_str}: fetched OK but could not save — {se}")
+                        storage_errors.append((day_str, str(se)))
                 progress.progress((i + 1) / len(days_to_fetch))
                 if i < len(days_to_fetch) - 1:
                     time.sleep(RATE_LIMIT_PAUSE)
@@ -302,12 +523,16 @@ with tab_update:
                 log_box.write(f"🔁 Retrying {len(errors)} failed day(s) ...")
                 for day_str, _ in errors:
                     time.sleep(RATE_LIMIT_PAUSE)
+                    filename = f"tefas_daily_{day_str}.csv"
                     df_day, err2 = fetch_one_day(crawler, day_str, KIND)
                     if df_day is not None:
-                        out_path = os.path.join(DATA_FOLDER, f"tefas_daily_{day_str}.csv")
-                        df_day.to_csv(out_path, index=False, encoding="utf-8-sig")
-                        saved.append(day_str)
-                        log_box.write(f"  {day_str} ✅ recovered")
+                        try:
+                            storage.write_csv(filename, df_day)
+                            saved.append(day_str)
+                            log_box.write(f"  {day_str} ✅ recovered")
+                        except StorageError as se:
+                            log_box.write(f"  {day_str} ❌ fetched but could not save — {se}")
+                            storage_errors.append((day_str, str(se)))
                     elif err2:
                         log_box.write(f"  {day_str} ❌ {err2}")
                         still_failed.append(day_str)
@@ -316,6 +541,9 @@ with tab_update:
 
             st.success(f"Backfill run complete — saved {len(saved)}, "
                        f"failed {len(still_failed)}.")
+            if storage_errors:
+                st.error(f"{len(storage_errors)} day(s) fetched successfully but "
+                         f"could not be saved to storage: {storage_errors}")
             if still_failed:
                 st.warning(f"Still failed: {still_failed}")
             if remaining_after > 0:
@@ -329,7 +557,7 @@ with tab_update:
             st.write(f"**Same-day fetch attempt for {today_str}:**")
             if today.weekday() >= 5:
                 st.info(f"Skipped — {today_str} is a weekend.")
-            elif os.path.exists(today_file):
+            elif storage.exists(today_file):
                 st.info("Already saved.")
             else:
                 df_today, err_today = fetch_one_day(crawler, today_str, KIND)
@@ -339,30 +567,38 @@ with tab_update:
                     st.info(f"No data published yet for {today_str} — normal "
                             f"if TEFAS hasn't finalized today's NAVs. Try again later.")
                 else:
-                    df_today.to_csv(today_file, index=False, encoding="utf-8-sig")
-                    st.success(f"{today_str} NAVs are live — saved {len(df_today):,} funds.")
+                    try:
+                        storage.write_csv(today_file, df_today)
+                        st.success(f"{today_str} NAVs are live — saved {len(df_today):,} funds.")
+                    except StorageError as se:
+                        st.error(f"Fetched today's data but could not save it: {se}")
 
         if ENABLE_AUTO_PRUNE:
             st.write("---")
-            fresh_files = list_existing_files(DATA_FOLDER)
-            to_remove = files_older_than(DATA_FOLDER, fresh_files, RETENTION_YEARS)
-            if to_remove:
-                removed, failed = prune_old_files(DATA_FOLDER, to_remove)
-                st.write(f"**Retention pruning** (keeping last {RETENTION_YEARS:g} years):")
-                if removed:
-                    st.success(f"🗑️ Pruned {len(removed)} file(s) older than the retention "
-                               f"window ({removed[0][12:22]} → {removed[-1][12:22]}).")
-                if failed:
-                    st.warning(f"Could not remove {len(failed)} file(s): {failed}")
-            else:
-                st.write(f"**Retention pruning:** nothing older than "
-                         f"{RETENTION_YEARS:g} years — no files removed.")
+            try:
+                fresh_files = sorted(storage.list_files_with_sizes().keys())
+                to_remove = files_older_than(fresh_files, RETENTION_YEARS)
+                if to_remove:
+                    removed, failed = storage.delete_files(to_remove)
+                    st.write(f"**Retention pruning** (keeping last {RETENTION_YEARS:g} years):")
+                    if removed:
+                        st.success(f"🗑️ Pruned {len(removed)} file(s) older than the retention "
+                                   f"window ({removed[0][12:22]} → {removed[-1][12:22]}).")
+                    if failed:
+                        st.warning(f"Could not remove {len(failed)} file(s): {failed}")
+                else:
+                    st.write(f"**Retention pruning:** nothing older than "
+                             f"{RETENTION_YEARS:g} years — no files removed.")
+            except StorageError as e:
+                st.warning(f"Could not run retention pruning: {e}")
 
         st.divider()
-        fresh_files = list_existing_files(DATA_FOLDER)
-        fresh_bytes = folder_size_bytes(DATA_FOLDER, fresh_files)
-        st.write(f"**Updated status:** {len(fresh_files)} file(s) on disk, "
-                 f"{human_size(fresh_bytes)} total.")
+        try:
+            fresh = storage.list_files_with_sizes()
+            st.write(f"**Updated status:** {len(fresh)} file(s) stored, "
+                     f"{human_size(sum(fresh.values()))} total.")
+        except StorageError as e:
+            st.warning(f"Could not refresh status: {e}")
 
     st.divider()
     st.subheader("Manual pruning")
@@ -376,11 +612,14 @@ with tab_update:
         st.write(f"**{len(prune_preview)} file(s)** would be removed "
                  f"({prune_preview[0][12:22]} → {prune_preview[-1][12:22]}).")
         if st.button(f"🗑️ Prune Now ({len(prune_preview)} file(s))"):
-            removed, failed = prune_old_files(DATA_FOLDER, prune_preview)
-            if removed:
-                st.success(f"Removed {len(removed)} file(s).")
-            if failed:
-                st.warning(f"Could not remove {len(failed)} file(s): {failed}")
+            try:
+                removed, failed = storage.delete_files(prune_preview)
+                if removed:
+                    st.success(f"Removed {len(removed)} file(s).")
+                if failed:
+                    st.warning(f"Could not remove {len(failed)} file(s): {failed}")
+            except StorageError as e:
+                st.error(f"Pruning failed: {e}")
     else:
         st.write("Nothing to prune at the current retention setting.")
 
@@ -399,14 +638,18 @@ with tab_screen:
     MIN_INVESTOR_COUNT = p3.number_input("Min investor count", min_value=0, max_value=100000, value=200, step=50)
     LOOKBACK_DAYS = p4.number_input(
         "CSV lookback window (days)", min_value=200, max_value=1200, value=215, step=5,
-        help="Only load CSVs from this many calendar days back -- must be "
+        help="Only load files from this many calendar days back -- must be "
              "comfortably more than the 6-month (126 trading-day) horizon. "
              "Capped at 1200 (~3.3 years) to match the Update Data tab's "
-             "default retention window -- there's no point setting this "
-             "higher than however much history you're actually keeping on disk."
+             "default retention window."
     )
 
-    existing_files = list_existing_files(DATA_FOLDER)
+    try:
+        existing_files = sorted(storage.list_files_with_sizes().keys())
+    except StorageError as e:
+        st.error(f"Could not read from storage: {e}")
+        st.stop()
+
     cutoff = date.today() - timedelta(days=int(LOOKBACK_DAYS))
     csv_files = sorted([
         f for f in existing_files
@@ -414,20 +657,21 @@ with tab_screen:
     ])
 
     if not csv_files:
-        st.warning("No CSV files in the lookback window yet — use the "
+        st.warning("No files in the lookback window yet — use the "
                    "**Update Data** tab to fetch some first.")
         st.stop()
 
     # ── Cached, expensive step: load + clean raw CSVs ──────────────
-    @st.cache_data(show_spinner="Loading and cleaning local CSVs ...")
-    def load_raw(data_folder, csv_files_tuple):
+    # _storage has a leading underscore so Streamlit doesn't try to hash
+    # the backend object itself (it isn't hashable in a meaningful way,
+    # especially the S3 client) -- cache_key + the file tuple do the
+    # actual cache-invalidation work instead.
+    @st.cache_data(show_spinner="Loading and cleaning data ...")
+    def load_raw(_storage, cache_key, csv_files_tuple):
         frames = []
         for fname in csv_files_tuple:
             try:
-                frames.append(pd.read_csv(
-                    os.path.join(data_folder, fname),
-                    encoding="utf-8-sig", low_memory=False
-                ))
+                frames.append(_storage.read_csv(fname))
             except Exception as e:
                 st.warning(f"Could not read {fname}: {e}")
         if not frames:
@@ -482,20 +726,20 @@ with tab_screen:
 
     try:
         price_df_full, name_map, investor_snapshot, investor_col, data_latest_date = load_raw(
-            DATA_FOLDER, tuple(csv_files)
+            storage, storage_cache_key, tuple(csv_files)
         )
     except ColumnDetectionError as e:
         st.error(
-            f"⚠️ Problem reading the local CSV files: {e}\n\n"
+            f"⚠️ Problem reading the stored CSV files: {e}\n\n"
             f"This usually means one of the daily files has an unexpected "
             f"format (a corrupted download, an interrupted write, or a "
-            f"pytefas schema change). Check the files in `{DATA_FOLDER}`, "
-            f"or try re-fetching the affected day(s) from the **Update Data** tab."
+            f"pytefas schema change). Try re-fetching the affected day(s) "
+            f"from the **Update Data** tab."
         )
         st.stop()
 
     if price_df_full is None:
-        st.error("No CSV files could be loaded.")
+        st.error("No files could be loaded.")
         st.stop()
 
     st.caption(f"Loaded {len(csv_files)} daily file(s) | "
@@ -510,8 +754,7 @@ with tab_screen:
         price_df = price_df[[c for c in price_df.columns if c in qualified]]
         st.write(f"👥 Investor filter (≥{MIN_INVESTOR_COUNT}): "
                  f"{len(price_df.columns)} / {before_n} funds qualify "
-                 f"(as of {investor_snapshot.name if hasattr(investor_snapshot, 'name') else ''} "
-                 f"latest snapshot)")
+                 f"(latest snapshot)")
     elif not investor_col:
         st.info("No investor_count column detected — investor filter skipped.")
 
