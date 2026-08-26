@@ -84,6 +84,7 @@ MAX_BAD_TICK_FRACTION = 0.05
 MAX_INTERP_GAP_TDAYS = 5
 
 FLOW_WINDOWS_TDAYS = [1, 5, 10, 20]
+MONTH_TDAYS = 22   # "last month" convention used in the summary table below
 
 
 def find_col(df, patterns):
@@ -163,8 +164,8 @@ def screen_funds(price_df, investor_snapshot, lookback_tdays, min_history_tdays,
 
         rows.append({
             "fund_code": code,
+            "total_return_%": round(total_ret * 100, 2),   # actual return over the window used -- see it first
             "n_days_used": n_obs,
-            "total_return_%": round(total_ret * 100, 2),
             "ann_return_%": round(ann_ret * 100, 2),
             "ann_vol_%": round(ann_vol * 100, 2),
             "sharpe": round(sharpe, 3),
@@ -182,26 +183,85 @@ def screen_funds(price_df, investor_snapshot, lookback_tdays, min_history_tdays,
 def money_flow_table(price_df, shares_df, fund_codes, windows_tdays):
     """Daily flow = Δshares_outstanding * price (independent of price
     moves -- the cleanest signal, same convention as the backtest
-    scripts), normalized to %-of-prior-day-AUM, then SUMMED over each
-    window (not averaged) since these are different-length snapshots,
-    not one rolling figure."""
+    scripts).
+
+    FIXED: previously summed daily flow-as-%-of-PRIOR-DAY-AUM values
+    directly. That's invalid -- each day's percentage is relative to a
+    DIFFERENT (shrinking or growing) base, so summing them isn't a
+    meaningful cumulative figure and can produce results below -100%
+    even though a fund can never lose more than 100% of its assets
+    (verified: 7 days of ~-20%/day outflows summed to -132%, while the
+    true compounded decline was -76.9%). Now: sum the raw TRY flow
+    (dollars ARE additive, no issue there), then divide by ONE fixed
+    reference -- the AUM immediately before the window started -- same
+    convention as every other return figure in this app (ending vs. a
+    single starting point, not a chain of shifting bases)."""
     codes = [c for c in fund_codes if c in shares_df.columns and c in price_df.columns]
     if not codes:
         return pd.DataFrame()
 
     shares = shares_df[codes]
     price = price_df[codes]
-    daily_flow = shares.diff() * price
+    daily_flow_try = shares.diff() * price
     prior_aum = shares.shift(1) * price.shift(1)
-    flow_pct = daily_flow / prior_aum.replace(0, np.nan)
 
     rows = []
     for code in codes:
-        s = flow_pct[code].dropna()
+        flow_s = daily_flow_try[code].dropna()
         row = {"fund_code": code}
         for w in windows_tdays:
-            window = s.iloc[-w:]
-            row[f"flow_{w}d_%"] = round(window.sum() * 100, 2) if len(window) else None
+            window = flow_s.iloc[-w:]
+            if len(window) == 0:
+                row[f"flow_{w}d_try"] = None
+                row[f"flow_{w}d_%"] = None
+                continue
+            total_flow = window.sum()
+            base_aum = prior_aum[code].get(window.index[0], np.nan)   # AUM right before the window began
+            row[f"flow_{w}d_try"] = round(total_flow, 0)
+            row[f"flow_{w}d_%"] = (round(100 * total_flow / base_aum, 2)
+                                    if pd.notna(base_aum) and base_aum != 0 else None)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def fund_summary_table(price_df, shares_df, name_map, results_df, month_tdays=MONTH_TDAYS):
+    """fund_name, fund_code, sharpe, last-month (month_tdays) return, and
+    NOMINAL (raw TRY, not %-of-AUM) money flow: last 1 day, plus the
+    AVERAGE daily flow over the last 5 and last {month_tdays} days --
+    averages here, not sums, per what was asked (distinct from the
+    windowed money_flow_table above, which sums)."""
+    daily_flow_try = None
+    if shares_df is not None:
+        common = [c for c in results_df["fund_code"] if c in shares_df.columns and c in price_df.columns]
+        if common:
+            daily_flow_try = shares_df[common].diff() * price_df[common]
+
+    rows = []
+    for _, r in results_df.iterrows():
+        code = r["fund_code"]
+        p = price_df[code].dropna() if code in price_df.columns else pd.Series(dtype=float)
+        if len(p) >= month_tdays + 1:
+            ret_month_pct = round((p.iloc[-1] / p.iloc[-(month_tdays + 1)] - 1) * 100, 2)
+        else:
+            ret_month_pct = None
+
+        row = {
+            "fund_name": name_map.get(code, ""),
+            "fund_code": code,
+            "sharpe": r["sharpe"],
+            f"return_{month_tdays}d_%": ret_month_pct,
+        }
+
+        if daily_flow_try is not None and code in daily_flow_try.columns:
+            flow_s = daily_flow_try[code].dropna()
+            row["flow_1d_try"] = round(flow_s.iloc[-1], 0) if len(flow_s) >= 1 else None
+            row["flow_5d_avg_try"] = round(flow_s.iloc[-5:].mean(), 0) if len(flow_s) >= 1 else None
+            row[f"flow_{month_tdays}d_avg_try"] = round(flow_s.iloc[-month_tdays:].mean(), 0) if len(flow_s) >= 1 else None
+        else:
+            row["flow_1d_try"] = None
+            row["flow_5d_avg_try"] = None
+            row[f"flow_{month_tdays}d_avg_try"] = None
+
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -302,6 +362,7 @@ code_col = find_col(raw, [r'fund_code'])
 price_col = find_col(raw, [r'^price$'])
 investor_col = find_col(raw, [r'investor_count'])
 shares_col = find_col(raw, [r'shares_outstanding'])
+name_col = find_col(raw, [r'fund_name'])
 
 missing = [(l, c) for l, c in [("date", date_col), ("code", code_col), ("price", price_col)] if c is None]
 if missing:
@@ -317,6 +378,11 @@ if investor_col:
     raw[investor_col] = pd.to_numeric(raw[investor_col], errors="coerce")
 if shares_col:
     raw[shares_col] = pd.to_numeric(raw[shares_col], errors="coerce")
+
+name_map = {}
+if name_col:
+    name_map = (raw.sort_values(date_col).dropna(subset=[name_col])
+                   .groupby(code_col)[name_col].last().to_dict())
 
 price_df = (raw[[date_col, code_col, price_col]]
             .drop_duplicates(subset=[date_col, code_col], keep="last")
@@ -371,6 +437,13 @@ st.subheader(f"🏆 Top {len(results)} by Sharpe ratio")
 st.caption(f"Window: up to {LOOKBACK_TDAYS} trading days | "
            f"min annualized return ≥{MIN_ANN_RETURN_PCT:.1f}% | "
            f"min investors ≥{MIN_INVESTOR_COUNT}")
+st.caption("ℹ️ `total_return_%` is the actual return over the window used. "
+           "`ann_return_%` is a compounded (CAGR-style) extrapolation of that "
+           "same return to a full year, which can look extreme for short "
+           "windows with large returns -- e.g. a fund up 100% in 3 months "
+           "annualizes to +1500%, since compounding assumes that exact rate "
+           "repeats 4 times over. Treat `total_return_%` as the grounded, "
+           "actually-observed figure.")
 st.dataframe(results, width="stretch", hide_index=True)
 
 # ── Top-10 deep dive ────────────────────────────────────────────────
@@ -395,6 +468,14 @@ else:
 
 st.markdown("**Return stats**")
 st.dataframe(
-    top10[["fund_code", "sharpe", "max_drawdown_%", "calmar", "ann_return_%", "ann_vol_%"]],
+    top10[["fund_code", "total_return_%", "sharpe", "max_drawdown_%", "calmar", "ann_return_%", "ann_vol_%"]],
     width="stretch", hide_index=True
 )
+
+st.markdown(f"**Fund summary — name, Sharpe, last {MONTH_TDAYS}-day return, nominal money flow**")
+st.caption(f"`flow_1d_try` is a single day's raw flow (TRY). `flow_5d_avg_try` and "
+           f"`flow_{MONTH_TDAYS}d_avg_try` are the AVERAGE daily flow over each "
+           f"window (not summed) -- distinct from the money-flow table above, "
+           f"which sums cumulative flow as %-of-AUM.")
+summary_df = fund_summary_table(price_df, shares_df, name_map, top10, MONTH_TDAYS)
+st.dataframe(summary_df, width="stretch", hide_index=True)
