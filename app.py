@@ -224,6 +224,22 @@ def money_flow_table(price_df, shares_df, fund_codes, windows_tdays):
     return pd.DataFrame(rows)
 
 
+def format_money_try(value):
+    """Abbreviate a raw TRY amount to k/m/bn, 1 decimal -- e.g. 2.0m, 4.2bn,
+    -1.5m for outflows. None/NaN pass through as None."""
+    if value is None or pd.isna(value):
+        return None
+    sign = "-" if value < 0 else ""
+    abs_val = abs(value)
+    if abs_val >= 1e9:
+        return f"{sign}{abs_val / 1e9:.1f}bn"
+    elif abs_val >= 1e6:
+        return f"{sign}{abs_val / 1e6:.1f}m"
+    elif abs_val >= 1e3:
+        return f"{sign}{abs_val / 1e3:.1f}k"
+    return f"{sign}{abs_val:.1f}"
+
+
 def fund_summary_table(price_df, shares_df, name_map, results_df, month_tdays=MONTH_TDAYS):
     """fund_name, fund_code, sharpe, last-month (month_tdays) return, and
     NOMINAL (raw TRY, not %-of-AUM) money flow: last 1 day, plus the
@@ -254,9 +270,11 @@ def fund_summary_table(price_df, shares_df, name_map, results_df, month_tdays=MO
 
         if daily_flow_try is not None and code in daily_flow_try.columns:
             flow_s = daily_flow_try[code].dropna()
-            row["flow_1d_try"] = round(flow_s.iloc[-1], 0) if len(flow_s) >= 1 else None
-            row["flow_5d_avg_try"] = round(flow_s.iloc[-5:].mean(), 0) if len(flow_s) >= 1 else None
-            row[f"flow_{month_tdays}d_avg_try"] = round(flow_s.iloc[-month_tdays:].mean(), 0) if len(flow_s) >= 1 else None
+            row["flow_1d_try"] = format_money_try(flow_s.iloc[-1]) if len(flow_s) >= 1 else None
+            row["flow_5d_avg_try"] = format_money_try(flow_s.iloc[-5:].mean()) if len(flow_s) >= 1 else None
+            row[f"flow_{month_tdays}d_avg_try"] = (
+                format_money_try(flow_s.iloc[-month_tdays:].mean()) if len(flow_s) >= 1 else None
+            )
         else:
             row["flow_1d_try"] = None
             row["flow_5d_avg_try"] = None
