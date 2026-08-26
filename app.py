@@ -53,6 +53,7 @@ from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import streamlit as st
 
 try:
@@ -306,6 +307,58 @@ def plot_scaled_prices(price_df, fund_codes, lookback_tdays, title):
     return fig
 
 
+def plot_money_flow_bars(price_df, shares_df, fund_codes, title):
+    """Grouped bar chart: one group per fund, 3 bars = last 1-day flow,
+    last 5-day avg flow, last 22-day avg flow (raw TRY, same figures as
+    the Fund summary table). Funds sorted by the 1-day flow, descending."""
+    if shares_df is None:
+        return None
+    codes = [c for c in fund_codes if c in shares_df.columns and c in price_df.columns]
+    if not codes:
+        return None
+
+    daily_flow_try = shares_df[codes].diff() * price_df[codes]
+
+    rows = []
+    for code in codes:
+        flow_s = daily_flow_try[code].dropna()
+        if len(flow_s) == 0:
+            continue
+        rows.append((
+            code,
+            flow_s.iloc[-1],
+            flow_s.iloc[-5:].mean(),
+            flow_s.iloc[-MONTH_TDAYS:].mean(),
+        ))
+    if not rows:
+        return None
+
+    rows.sort(key=lambda r: r[1], reverse=True)   # sort by 1-day flow, descending
+    codes_sorted = [r[0] for r in rows]
+    flow_1d = [r[1] for r in rows]
+    flow_5d = [r[2] for r in rows]
+    flow_22d = [r[3] for r in rows]
+
+    x = np.arange(len(codes_sorted))
+    width = 0.26
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    ax.bar(x - width, flow_1d, width, label="Last 1 day", color="tab:blue")
+    ax.bar(x, flow_5d, width, label="Last 5 days (avg)", color="tab:orange")
+    ax.bar(x + width, flow_22d, width, label=f"Last {MONTH_TDAYS} days (avg)", color="tab:green")
+
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(codes_sorted)
+    ax.set_ylabel("Money flow (TRY)")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, _: format_money_try(y) or "0"))
+    ax.set_title(title, fontsize=11)
+    ax.legend()
+    ax.grid(True, alpha=0.25, axis="y")
+    plt.tight_layout()
+    return fig
+
+
 # ════════════════════════════════════════════════════════════════════
 #  PAGE
 # ════════════════════════════════════════════════════════════════════
@@ -481,6 +534,16 @@ st.markdown("**Money flow (% of prior-day AUM, summed over each window)**")
 if shares_df is not None:
     flow_df = money_flow_table(price_df, shares_df, top10_codes, FLOW_WINDOWS_TDAYS)
     st.dataframe(flow_df, width="stretch", hide_index=True)
+else:
+    st.caption("Skipped -- no shares_outstanding data available this fetch.")
+
+st.markdown("**Money flow ranking (nominal TRY, sorted by last 1-day flow)**")
+flow_fig = plot_money_flow_bars(
+    price_df, shares_df, top10_codes,
+    f"Top {len(top10)} funds — money flow: last 1 day vs 5-day avg vs {MONTH_TDAYS}-day avg"
+)
+if flow_fig is not None:
+    st.pyplot(flow_fig)
 else:
     st.caption("Skipped -- no shares_outstanding data available this fetch.")
 
