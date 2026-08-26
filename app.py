@@ -467,7 +467,7 @@ MIN_ANN_RETURN_PCT = st.sidebar.number_input(
          "window to be considered at all."
 )
 MIN_INVESTOR_COUNT = st.sidebar.number_input(
-    "Min investor count", min_value=0, max_value=100000, value=200, step=50
+    "Min investor count", min_value=0, max_value=100000, value=250, step=50
 )
 TOP_N = st.sidebar.number_input("Funds to show in main table", min_value=5, max_value=200, value=50, step=5)
 RISK_FREE_RATE = st.sidebar.number_input(
