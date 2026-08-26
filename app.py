@@ -852,23 +852,29 @@ else:
                 else:
                     st.caption("Need at least 2 funds to show a correlation matrix.")
 
-                st.subheader("Per-fund price & AUM")
+                st.subheader("Per-fund price & AUM (both scaled to start = 1.0)")
                 for t in found:
                     p = price_df[t].iloc[-LOOKBACK_TDAYS:]
+                    p_valid = p.dropna()
+                    p_scaled = p / p_valid.iloc[0] if len(p_valid) else p
+
                     fig2, ax1 = plt.subplots(figsize=(12, 4.5))
-                    ax1.plot(p.index, p.values, color="tab:blue", lw=1.8, label="Price")
-                    ax1.set_ylabel("Price (TRY)", color="tab:blue")
+                    ax1.plot(p_scaled.index, p_scaled.values, color="tab:blue", lw=1.8, label="Price")
+                    ax1.set_ylabel("Price (scaled, start = 1.0)", color="tab:blue")
                     ax1.tick_params(axis="y", labelcolor="tab:blue")
+                    ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, _: f"{y:.2f}x"))
                     ax1.set_xlabel("Date")
+                    ax1.axhline(1.0, color="gray", lw=0.7, linestyle=":", alpha=0.5)
 
                     if shares_df is not None and t in shares_df.columns:
                         aum = (shares_df[t] * price_df[t]).iloc[-LOOKBACK_TDAYS:]
+                        aum_valid = aum.dropna()
+                        aum_scaled = aum / aum_valid.iloc[0] if len(aum_valid) else aum
                         ax2 = ax1.twinx()
-                        ax2.plot(aum.index, aum.values, color="tab:red", lw=1.4, alpha=0.8, label="AUM")
-                        ax2.set_ylabel("AUM (TRY)", color="tab:red")
+                        ax2.plot(aum_scaled.index, aum_scaled.values, color="tab:red", lw=1.4, alpha=0.8, label="AUM")
+                        ax2.set_ylabel("AUM (scaled, start = 1.0)", color="tab:red")
                         ax2.tick_params(axis="y", labelcolor="tab:red")
-                        ax2.yaxis.set_major_formatter(
-                            mticker.FuncFormatter(lambda y, _: format_money_try(y) or "0"))
+                        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, _: f"{y:.2f}x"))
 
                     ax1.set_title(f"{t} — {name_map.get(t, '')}", fontsize=11)
                     ax1.grid(True, alpha=0.2)
