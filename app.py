@@ -712,7 +712,7 @@ st.dataframe(summary_df, width="stretch", hide_index=True)
 #  already selected in the sidebar for "the selected period".
 # ════════════════════════════════════════════════════════════════════
 if "custom_tickers" not in st.session_state:
-    st.session_state.custom_tickers = "PRY, TLY, GTZ, BSM"
+    st.session_state.custom_tickers = "TLY, GTZ, BSM, TMV, DFI, ECA, ICH, PTO"
 
 
 def _add_ticker_callback(code):
