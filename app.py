@@ -47,14 +47,21 @@ since all of those are derived from the same filtered set. This is applied
 on top of the initial filter (history floor + min annualized return + min
 investors), not instead of it.
 
-CATEGORY FILTER (optional): a sidebar checkbox per fund category, ALL
-ticked by default. Unticking a category excludes every fund in that
-category from the qualifying set outright -- same treatment as the max
-drawdown filter above (main table, Top-10 deep dive, and inflow/outflow
-universe all shrink accordingly). Like the max drawdown filter, this is
+HOUSE KEYWORD FILTER (optional): a sidebar text input of comma-separated
+keywords (default "Pusula, Tera, Atlas" -- portfolio management companies
+whose funds recently declared default), matched case-insensitively as a
+substring against each fund's name. Any fund whose name contains ANY of
+these keywords is excluded from the qualifying set outright -- same
+treatment as the max drawdown filter above (main table, Top-10 deep dive,
+and inflow/outflow universe all shrink accordingly). Matching against
+fund NAME (not category) because TEFAS's naming convention puts the
+portfolio management company's name directly in the fund's title (e.g.
+"Tera Portföy Birinci ... Fonu"), and unlike fund category, fund_name is
+a field the API actually returns. Like the max drawdown filter, this is
 a Screener-only filter: the Custom Portfolio section explicitly bypasses
 it, since that section is a user-driven, explicit ticker list against
-the full fetched universe, not a screened/ranked set.
+the full fetched universe, not a screened/ranked set. Clear the keyword
+field entirely to disable this filter.
 
 TOP-10 DEEP DIVE: independent of how many rows the main table shows,
 the top 10 by Sharpe get a scaled cumulative-price chart (all starting
@@ -115,21 +122,13 @@ MAX_INTERP_GAP_TDAYS = 5
 FLOW_WINDOWS_TDAYS = [1, 5, 10, 20]
 MONTH_TDAYS = 22   # "last month" convention used in the summary table below
 
-DEFAULT_EXCLUDED_CATEGORY_PATTERNS = []
-# Category checkboxes that start UNTICKED (excluded) the first time the app
-# loads, before the user has touched anything -- matched as a case-insensitive
-# substring/regex against the category name, not an exact string, so this
-# still catches label variants like "Serbest Şemsiye Fonu" or "Serbest Fon"
-# without needing pytefas's exact wording. Once the user manually ticks/
-# unticks a box, their choice is remembered in session_state and this
-# default is no longer consulted for that category during the session.
-# Add more patterns here (e.g. r'para piyasası') to exclude other
-# categories by default too -- an empty list restores "everything ticked".
-
-
-def _category_default_checked(category_name):
-    return not any(re.search(pat, category_name, re.I) for pat in DEFAULT_EXCLUDED_CATEGORY_PATTERNS)
-
+DEFAULT_EXCLUDED_HOUSE_KEYWORDS = "Pusula, Tera, Atlas"
+# Comma-separated default for the sidebar's investment-house keyword
+# filter -- these three portfolio management companies' funds recently
+# declared default. Matched case-insensitively as a substring against
+# each fund's NAME (TEFAS's naming convention puts the portfolio
+# management company's name directly in the fund title). Editable in
+# the sidebar; clear the field entirely to disable this filter.
 
 
 def find_col(df, patterns):
@@ -172,8 +171,7 @@ def clean_bad_ticks(price_df):
 
 def screen_funds_all(price_df, investor_snapshot, lookback_tdays, min_history_tdays,
                       min_ann_return, min_investors, risk_free,
-                      max_drawdown_limit_pct=None,
-                      category_map=None, excluded_categories=None):
+                      max_drawdown_limit_pct=None, excluded_fund_codes=None):
     """Returns a DataFrame with one row per fund that clears the initial
     filter (history floor + min annualized return + min investors) --
     the FULL qualifying set, sorted by Sharpe descending but NOT
@@ -187,19 +185,15 @@ def screen_funds_all(price_df, investor_snapshot, lookback_tdays, min_history_td
     same "excluded outright" treatment as the other initial-filter
     conditions, not a post-hoc dimming/highlighting.
 
-    `category_map` / `excluded_categories`: optional. `category_map` is
-    fund_code -> category name. When `excluded_categories` is a non-empty
-    set, any fund whose category is IN that set is excluded outright --
-    same treatment as the other initial-filter conditions. A fund with
-    no entry in `category_map` (unknown/undetected category) is never
-    excluded by this filter, since we can't tell which category it
-    would even belong to."""
+    `excluded_fund_codes`: optional set of fund codes to exclude outright
+    (e.g. funds matched against the investment-house keyword filter) --
+    same treatment as the other initial-filter conditions."""
     daily_log_ret = np.log(price_df / price_df.shift(1))
     rows = []
     for code in price_df.columns:
-        # Category filter: check first, cheapest possible short-circuit
+        # Excluded-code filter: check first, cheapest possible short-circuit
         # before any numeric work on this fund at all.
-        if excluded_categories and category_map and category_map.get(code) in excluded_categories:
+        if excluded_fund_codes and code in excluded_fund_codes:
             continue
 
         # NEW: check history in terms of PRICE observations, not the
@@ -240,7 +234,6 @@ def screen_funds_all(price_df, investor_snapshot, lookback_tdays, min_history_td
 
         rows.append({
             "fund_code": code,
-            "category": category_map.get(code) if category_map else None,
             "total_return_%": round(total_ret * 100, 2),   # actual return over the window used -- see it first
             "n_days_used": n_obs,
             "ann_return_%": round(ann_ret * 100, 2),
@@ -254,15 +247,12 @@ def screen_funds_all(price_df, investor_snapshot, lookback_tdays, min_history_td
     result = pd.DataFrame(rows)
     if result.empty:
         return result
-    if category_map is None:
-        result = result.drop(columns=["category"])
     return result.sort_values("sharpe", ascending=False).reset_index(drop=True)
 
 
 def screen_funds(price_df, investor_snapshot, lookback_tdays, min_history_tdays,
                   min_ann_return, min_investors, risk_free, top_n,
-                  max_drawdown_limit_pct=None,
-                  category_map=None, excluded_categories=None):
+                  max_drawdown_limit_pct=None, excluded_fund_codes=None):
     """Same as screen_funds_all, truncated to the top_n by Sharpe --
     kept as a separate thin wrapper so existing call sites/behavior
     don't change."""
@@ -270,11 +260,28 @@ def screen_funds(price_df, investor_snapshot, lookback_tdays, min_history_tdays,
         price_df, investor_snapshot, lookback_tdays, min_history_tdays,
         min_ann_return, min_investors, risk_free,
         max_drawdown_limit_pct=max_drawdown_limit_pct,
-        category_map=category_map, excluded_categories=excluded_categories
+        excluded_fund_codes=excluded_fund_codes
     )
     if all_qualified.empty:
         return all_qualified
     return all_qualified.head(top_n).reset_index(drop=True)
+
+
+def excluded_codes_by_house_keywords(name_map, keywords_str):
+    """Given fund_code -> fund_name and a comma-separated keyword string,
+    return the set of fund codes whose NAME contains any keyword
+    (case-insensitive substring match). Empty/blank keywords_str returns
+    an empty set (filter disabled). Matching is against fund_name because
+    TEFAS naming convention puts the portfolio management company's name
+    directly in the fund title -- e.g. a fund named "Tera Portföy Birinci
+    Değişken Fon" is caught by the keyword "Tera"."""
+    keywords = [k.strip().lower() for k in keywords_str.split(",") if k.strip()]
+    if not keywords:
+        return set()
+    return {
+        code for code, name in name_map.items()
+        if name and any(kw in name.lower() for kw in keywords)
+    }
 
 
 def money_flow_table(price_df, shares_df, fund_codes, windows_tdays):
@@ -680,7 +687,6 @@ price_col = find_col(raw, [r'^price$'])
 investor_col = find_col(raw, [r'investor_count'])
 shares_col = find_col(raw, [r'shares_outstanding'])
 name_col = find_col(raw, [r'fund_name'])
-category_col = find_col(raw, [r'categor', r'umbrella', r'fund_type', r'^type$'])
 
 missing = [(l, c) for l, c in [("date", date_col), ("code", code_col), ("price", price_col)] if c is None]
 if missing:
@@ -702,86 +708,27 @@ if name_col:
     name_map = (raw.sort_values(date_col).dropna(subset=[name_col])
                    .groupby(code_col)[name_col].last().to_dict())
 
-category_map = {}
-category_source = None
-if category_col:
-    # Would only trigger if a future pytefas version adds category to
-    # INFO_FIELDS -- confirmed (via a live raw-field probe against the
-    # actual TEFAS response) that pytefas 0.4.1's "info" endpoint returns
-    # exactly {fonKodu, fonUnvan, tarih, fiyat, tedPaySayisi, kisiSayisi,
-    # portfoyBuyukluk, borsaBultenFiyat, rn} -- no category/type field at
-    # all, `rn` being a row-number, not a label. TEFAS's API genuinely
-    # does not expose fund category through this endpoint; there is no
-    # further auto-detection to try here.
-    category_map = (raw.sort_values(date_col).dropna(subset=[category_col])
-                        .groupby(code_col)[category_col].last().to_dict())
-    category_source = f"`{category_col}` column in the fetched data"
-
-# ── Category filter (sidebar) ───────────────────────────────────────
+# ── Investment-house keyword filter (sidebar) ───────────────────────
 # Screener-only "initial filter" condition, same treatment as the max
-# drawdown filter above: applied inside screen_funds_all, NOT by
-# truncating price_df -- so a fund in an unticked category still shows
-# up fine if the user types its ticker directly into Custom Portfolio
-# below. Since TEFAS's own API doesn't expose fund category (see above),
-# the only reliable source is a user-supplied mapping: a two-column CSV
-# (fund_code, category) uploaded here. All categories ticked by default.
-with st.sidebar.expander("📂 Fund categories", expanded=not category_map):
-    if not category_map:
-        st.caption("ℹ️ TEFAS's API doesn't return fund category/type data "
-                   "(confirmed: the fetch only ever returns fund_code, "
-                   "fund_name, price, shares_outstanding, investor_count, "
-                   "portfolio_size -- no category field, at all, through "
-                   "any endpoint pytefas wraps).")
-        st.caption("To filter by category anyway, upload a two-column CSV "
-                   "below: `fund_code,category` -- one row per fund. You "
-                   "can build this yourself from TEFAS's own fund-comparison "
-                   "page (tefas.gov.tr), which does show category per fund "
-                   "even though the API doesn't return it in bulk.")
-    category_csv = st.file_uploader(
-        "Upload fund_code → category CSV", type=["csv"], key="category_csv_upload",
-        help="Two columns, any header names -- first column is treated as "
-             "fund_code, second as category. Fund codes are matched "
-             "case-insensitively against the fetched universe."
-    )
-    if category_csv is not None:
-        try:
-            cat_df = pd.read_csv(category_csv)
-            if cat_df.shape[1] < 2:
-                st.error("CSV needs at least 2 columns (fund_code, category).")
-            else:
-                code_series = cat_df.iloc[:, 0].astype(str).str.strip().str.upper()
-                cat_series = cat_df.iloc[:, 1].astype(str).str.strip()
-                category_map = dict(zip(code_series, cat_series))
-                category_source = f"uploaded CSV ({len(category_map)} fund(s) mapped)"
-                st.success(f"Loaded categories for {len(category_map)} fund(s) from the CSV.")
-        except Exception as e:
-            st.error(f"Couldn't parse that CSV: {e}")
-
-    EXCLUDED_CATEGORIES = set()
-    if category_map:
-        all_categories = sorted(set(category_map.values()))
-        st.caption(f"Source: {category_source}. All ticked by default. Untick to "
-                   "exclude a category from the Screener (main table, Top-10, "
-                   "inflow/outflow). Custom Portfolio below is unaffected -- "
-                   "you can still type any ticker directly.")
-        bcol1, bcol2 = st.columns(2)
-        if bcol1.button("Select all", key="cat_select_all"):
-            for cat in all_categories:
-                st.session_state[f"cat_{cat}"] = True
-        if bcol2.button("Clear all", key="cat_clear_all"):
-            for cat in all_categories:
-                st.session_state[f"cat_{cat}"] = False
-
-        selected_categories = set()
-        for cat in all_categories:
-            is_checked = st.checkbox(
-                cat, value=st.session_state.get(f"cat_{cat}", _category_default_checked(cat)),
-                key=f"cat_{cat}")
-            if is_checked:
-                selected_categories.add(cat)
-        EXCLUDED_CATEGORIES = set(all_categories) - selected_categories
-
-have_categories = bool(category_map)
+# drawdown filter above: applied inside screen_funds_all via
+# excluded_fund_codes, NOT by truncating price_df -- so an excluded
+# fund still shows up fine if the user types its ticker directly into
+# Custom Portfolio below. Matches against fund NAME (a field the API
+# actually returns), not category (which it doesn't -- see git history
+# /prior attempts). Default keywords: Pusula, Tera, Atlas.
+st.sidebar.header("🏢 Exclude by investment house")
+HOUSE_KEYWORDS_STR = st.sidebar.text_input(
+    "Exclude funds whose name contains (comma-separated)",
+    value=DEFAULT_EXCLUDED_HOUSE_KEYWORDS,
+    help="Case-insensitive substring match against each fund's name. "
+         "E.g. \"Tera\" excludes any fund named like \"Tera Portföy ... Fonu\". "
+         "Clear this field entirely to disable the filter. Screener-only -- "
+         "Custom Portfolio below is unaffected, you can still type any "
+         "ticker directly."
+)
+EXCLUDED_FUND_CODES = excluded_codes_by_house_keywords(name_map, HOUSE_KEYWORDS_STR)
+if EXCLUDED_FUND_CODES:
+    st.sidebar.caption(f"🚫 {len(EXCLUDED_FUND_CODES)} fund(s) excluded by name match.")
 
 price_df = (raw[[date_col, code_col, price_col]]
             .drop_duplicates(subset=[date_col, code_col], keep="last")
@@ -789,17 +736,6 @@ price_df = (raw[[date_col, code_col, price_col]]
             .sort_index())
 price_df.index = pd.to_datetime(price_df.index)
 price_df.columns.name = None
-
-if have_categories and category_source and category_source.startswith("uploaded CSV"):
-    matched = sum(1 for c in category_map if c in price_df.columns)
-    if matched == 0:
-        st.sidebar.warning("⚠️ None of the fund codes in that CSV matched the fetched "
-                            f"universe ({KIND}). Check the codes are uppercase TEFAS "
-                            "tickers (e.g. TLY, GTZ) and that you fetched the right "
-                            "Fund kind.")
-    else:
-        st.sidebar.caption(f"✓ {matched}/{len(category_map)} uploaded fund code(s) "
-                            f"matched the fetched {KIND} universe.")
 
 shares_df = None
 if shares_col:
@@ -831,36 +767,35 @@ price_df, dropped_funds = clean_bad_ticks(price_df)
 st.write(f"📂 Universe: **{price_df.shape[1]}** fund codes, **{price_df.shape[0]}** trading days "
          f"loaded ({price_df.index.min().date()} → {price_df.index.max().date()})"
          + (f" · dropped {len(dropped_funds)} fund(s) with unreliable price data" if dropped_funds else "")
-         + (f" · {len(EXCLUDED_CATEGORIES)} categor{'y' if len(EXCLUDED_CATEGORIES) == 1 else 'ies'} "
-            f"excluded from screening" if EXCLUDED_CATEGORIES else ""))
+         + (f" · {len(EXCLUDED_FUND_CODES)} fund(s) excluded by investment-house keyword"
+            if EXCLUDED_FUND_CODES else ""))
 
 all_qualified = screen_funds_all(
     price_df, investor_snapshot, LOOKBACK_TDAYS, MIN_HISTORY_TDAYS,
     MIN_ANN_RETURN_PCT / 100.0, MIN_INVESTOR_COUNT, RISK_FREE_RATE,
     max_drawdown_limit_pct=(MAX_DRAWDOWN_LIMIT_PCT if ENABLE_MAX_DRAWDOWN_FILTER else None),
-    category_map=(category_map if have_categories else None),
-    excluded_categories=EXCLUDED_CATEGORIES
+    excluded_fund_codes=EXCLUDED_FUND_CODES
 )
 results = all_qualified.head(TOP_N).reset_index(drop=True) if not all_qualified.empty else all_qualified
 
 if results.empty:
     dd_clause = (f" and max drawdown ≤{MAX_DRAWDOWN_LIMIT_PCT:.1f}%"
                  if ENABLE_MAX_DRAWDOWN_FILTER else "")
-    cat_clause = (f" ({len(EXCLUDED_CATEGORIES)} categor{'y' if len(EXCLUDED_CATEGORIES) == 1 else 'ies'} excluded)"
-                  if EXCLUDED_CATEGORIES else "")
+    house_clause = (f" ({len(EXCLUDED_FUND_CODES)} fund(s) excluded by investment-house keyword)"
+                     if EXCLUDED_FUND_CODES else "")
     st.warning(f"No funds passed at {MIN_ANN_RETURN_PCT:.1f}% min annualized return, "
-               f"≥{MIN_INVESTOR_COUNT} investors{dd_clause}{cat_clause}. Try loosening the filters.")
+               f"≥{MIN_INVESTOR_COUNT} investors{dd_clause}{house_clause}. Try loosening the filters.")
     st.stop()
 
 st.divider()
 st.subheader(f"🏆 Top {len(results)} by Sharpe ratio")
 dd_caption = (f" | max drawdown ≤{MAX_DRAWDOWN_LIMIT_PCT:.1f}%"
               if ENABLE_MAX_DRAWDOWN_FILTER else "")
-cat_caption = (f" | {len(EXCLUDED_CATEGORIES)} categor{'y' if len(EXCLUDED_CATEGORIES) == 1 else 'ies'} excluded"
-               if EXCLUDED_CATEGORIES else "")
+house_caption = (f" | {len(EXCLUDED_FUND_CODES)} fund(s) excluded by investment-house keyword"
+                  if EXCLUDED_FUND_CODES else "")
 st.caption(f"Window: up to {LOOKBACK_TDAYS} trading days | "
            f"min annualized return ≥{MIN_ANN_RETURN_PCT:.1f}% | "
-           f"min investors ≥{MIN_INVESTOR_COUNT}{dd_caption}{cat_caption}")
+           f"min investors ≥{MIN_INVESTOR_COUNT}{dd_caption}{house_caption}")
 st.caption("ℹ️ `total_return_%` is the actual return over the window used. "
            "`ann_return_%` is a compounded (CAGR-style) extrapolation of that "
            "same return to a full year, which can look extreme for short "
@@ -904,7 +839,7 @@ st.markdown("**Top 5 inflow vs top 5 outflow funds (initial-filter universe, no 
 st.caption(f"Drawn from all **{len(all_qualified)}** fund(s) that passed the initial filter "
            f"(history floor + min annualized return + min investors"
            f"{' + max drawdown cap' if ENABLE_MAX_DRAWDOWN_FILTER else ''}"
-           f"{' + category filter' if EXCLUDED_CATEGORIES else ''}) -- not limited to the "
+           f"{' + investment-house keyword filter' if EXCLUDED_FUND_CODES else ''}) -- not limited to the "
            f"Top {len(top10)} by Sharpe above. Ranked by last 1-day money flow.")
 if shares_df is not None:
     all_qualified_codes = all_qualified["fund_code"].tolist()
@@ -926,10 +861,10 @@ else:
     st.caption("Skipped -- no shares_outstanding data available this fetch.")
 
 st.markdown("**Return stats**")
-return_stats_cols = ["fund_code", "total_return_%", "sharpe", "max_drawdown_%", "calmar", "ann_return_%", "ann_vol_%"]
-if "category" in top10.columns:
-    return_stats_cols.insert(1, "category")
-st.dataframe(top10[return_stats_cols], width="stretch", hide_index=True)
+st.dataframe(
+    top10[["fund_code", "total_return_%", "sharpe", "max_drawdown_%", "calmar", "ann_return_%", "ann_vol_%"]],
+    width="stretch", hide_index=True
+)
 
 st.markdown(f"**Fund summary — name, Sharpe, last {MONTH_TDAYS}-day return, nominal money flow**")
 st.caption(f"`flow_1d_try` is a single day's raw flow (TRY). `flow_5d_avg_try` and "
@@ -947,8 +882,9 @@ st.dataframe(summary_df, width="stretch", hide_index=True)
 #  so "Run" is instant. Uses the same LOOKBACK_TDAYS / RISK_FREE_RATE
 #  already selected in the sidebar for "the selected period". The
 #  custom portfolio is a user-driven, explicit ticker list, so the
-#  optional max-drawdown filter AND the category filter above are NOT
-#  applied here -- they only govern the Screener's own qualifying set.
+#  optional max-drawdown filter AND the investment-house keyword filter
+#  above are NOT applied here -- they only govern the Screener's own
+#  qualifying set.
 # ════════════════════════════════════════════════════════════════════
 if "custom_tickers" not in st.session_state:
     st.session_state.custom_tickers = "TLY, GTZ, BSM, TMV, DFI, ECA, ICH, PTO"
@@ -971,8 +907,8 @@ st.sidebar.header("📁 Custom Portfolio")
 st.sidebar.text_input(
     "Tickers (comma-separated)", key="custom_tickers",
     help="Uses the SAME fetched fund universe as the Screener above (same "
-         "Fund kind) -- no extra fetch needed. Not affected by the category "
-         "filter or max drawdown filter above."
+         "Fund kind) -- no extra fetch needed. Not affected by the "
+         "investment-house keyword filter or max drawdown filter above."
 )
 
 with st.sidebar.expander("🔍 Search fund name to find a ticker"):
