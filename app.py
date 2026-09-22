@@ -115,6 +115,22 @@ MAX_INTERP_GAP_TDAYS = 5
 FLOW_WINDOWS_TDAYS = [1, 5, 10, 20]
 MONTH_TDAYS = 22   # "last month" convention used in the summary table below
 
+DEFAULT_EXCLUDED_CATEGORY_PATTERNS = []
+# Category checkboxes that start UNTICKED (excluded) the first time the app
+# loads, before the user has touched anything -- matched as a case-insensitive
+# substring/regex against the category name, not an exact string, so this
+# still catches label variants like "Serbest Şemsiye Fonu" or "Serbest Fon"
+# without needing pytefas's exact wording. Once the user manually ticks/
+# unticks a box, their choice is remembered in session_state and this
+# default is no longer consulted for that category during the session.
+# Add more patterns here (e.g. r'para piyasası') to exclude other
+# categories by default too -- an empty list restores "everything ticked".
+
+
+def _category_default_checked(category_name):
+    return not any(re.search(pat, category_name, re.I) for pat in DEFAULT_EXCLUDED_CATEGORY_PATTERNS)
+
+
 
 def find_col(df, patterns):
     for pat in patterns:
@@ -696,8 +712,9 @@ if category_col:
 # drawdown filter above: applied inside screen_funds_all, NOT by
 # truncating price_df -- so a fund in an unticked category still shows
 # up fine if the user types its ticker directly into Custom Portfolio
-# below. All categories ticked by default (nothing excluded until the
-# user actively unticks something).
+# below. All categories ticked by default (DEFAULT_EXCLUDED_CATEGORY_PATTERNS
+# in the CONFIG section is currently empty); untick anything in the
+# sidebar below to exclude it for the rest of the session.
 EXCLUDED_CATEGORIES = set()
 if category_col:
     all_categories = sorted(set(category_map.values()))
@@ -716,8 +733,9 @@ if category_col:
 
         selected_categories = set()
         for cat in all_categories:
-            is_checked = st.checkbox(cat, value=st.session_state.get(f"cat_{cat}", True),
-                                      key=f"cat_{cat}")
+            is_checked = st.checkbox(
+                cat, value=st.session_state.get(f"cat_{cat}", _category_default_checked(cat)),
+                key=f"cat_{cat}")
             if is_checked:
                 selected_categories.add(cat)
         EXCLUDED_CATEGORIES = set(all_categories) - selected_categories
