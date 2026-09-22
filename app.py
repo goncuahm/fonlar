@@ -887,7 +887,7 @@ st.dataframe(summary_df, width="stretch", hide_index=True)
 #  qualifying set.
 # ════════════════════════════════════════════════════════════════════
 if "custom_tickers" not in st.session_state:
-    st.session_state.custom_tickers = "TLY, GTZ, BSM, TMV, DFI, ECA, ICH, PTO"
+    st.session_state.custom_tickers = "ALE, GTZ, BSM, GZM, LPH, ECA"
 
 
 def _add_ticker_callback(code):
