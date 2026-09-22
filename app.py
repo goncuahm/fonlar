@@ -157,6 +157,92 @@ def fetch_universe(kind, lookback_tdays):
     return raw, datetime.now()
 
 
+# ── Best-effort fund-category probe ─────────────────────────────────
+# pytefas 0.4.1's `columns="info"` fetch only ever maps 8 fields (see
+# pytefas/schema.py INFO_FIELDS: date, kind, fund_code, fund_name, price,
+# shares_outstanding, investor_count, portfolio_size,
+# exchange_bulletin_price) -- there is NO category/fund-type field in
+# that output, by design, not a detection bug. But the raw TEFAS API
+# request body pytefas builds internally (see pytefas/client.py
+# `_fetch_single`) includes filter parameters like `fonTurAciklama`
+# ("fund type description") and `fonGrubu` ("fund group") -- TEFAS's raw
+# JSON response MAY include these (or similarly-named fields) per fund,
+# even though pytefas's own field_map silently discards anything not in
+# INFO_FIELDS. This probe reuses pytefas's already-rate-limited HTTP
+# client (Crawler()._client.post_json) with the EXACT same URL/body/
+# headers pytefas uses, but reads the FULL raw row dict instead of
+# pytefas's restricted field_map, to see if a usable category-like field
+# actually exists. Only queries ~10 recent calendar days of ONE `kind`
+# (not the full 200-day history) since a fund's category rarely changes
+# -- this is cheap, separate from the main fetch, and safe to fail: any
+# exception or "nothing plausible found" falls back to no category
+# filter at all, exactly like before this probe existed.
+_CATEGORY_FIELD_CANDIDATES = [
+    r'^fonTurAciklama$', r'^fonTur$', r'^fonGrubu$', r'^fonGrup$',
+    r'^sfonTurAciklama$', r'^sfonTur$', r'tur.*aciklama', r'kategori',
+    r'grup', r'(?<!Kod)Tur$',
+]
+_CATEGORY_FIELD_EXCLUDE = {
+    'fonKodu', 'fonUnvan', 'tarih', 'fiyat', 'tedPaySayisi', 'kisiSayisi',
+    'portfoyBuyukluk', 'borsaBultenFiyat', 'kind', 'fonTurKod', 'sfonTurKod',
+}
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def probe_raw_category_field(kind):
+    """Returns (field_name_used_or_None, {fund_code: category_value},
+    error_message_or_None). Never raises -- any failure just means no
+    category filter is available, same UX as if this probe didn't exist."""
+    try:
+        from pytefas.client import (  # pytefas "private" internals -- stable
+            _parse_date, INFO_URL, DEFAULT_HEADERS,
+        )
+        crawler = get_crawler()
+        end_dt = _parse_date(date.today())
+        start_dt = end_dt - timedelta(days=10)
+        body = {
+            "fonTipi": kind, "fonKodu": None, "aramaMetni": None,
+            "fonTurKod": None, "fonGrubu": None, "sfonTurKod": None,
+            "fonTurAciklama": None, "kurucuKod": None,
+            "basTarih": start_dt.strftime("%Y%m%d"),
+            "bitTarih": end_dt.strftime("%Y%m%d"),
+            "basSira": 1, "bitSira": 100000, "dil": "TR",
+            "sFonTurKod": "", "fonKod": "", "fonGrup": "", "fonUnvanTip": "",
+        }
+        data = crawler._client.post_json(INFO_URL, body, DEFAULT_HEADERS)
+        rows = data.get("resultList") or []
+        if not rows:
+            return None, {}, "TEFAS returned no rows for the probe window (holiday run?)."
+
+        candidate_keys = [k for k in rows[0].keys() if k not in _CATEGORY_FIELD_EXCLUDE]
+        chosen_key = None
+        for pat in _CATEGORY_FIELD_CANDIDATES:
+            for k in candidate_keys:
+                if re.search(pat, k, re.I):
+                    # Require it to actually carry non-null, non-numeric-only
+                    # values for a handful of rows before trusting it.
+                    sample = [r.get(k) for r in rows[:50] if r.get(k) not in (None, "")]
+                    if sample and any(isinstance(v, str) and not v.isdigit() for v in sample):
+                        chosen_key = k
+                        break
+            if chosen_key:
+                break
+
+        if not chosen_key:
+            return None, {}, ("No plausible category-like text field found in the raw "
+                               f"TEFAS response. Fields present: {sorted(rows[0].keys())}")
+
+        cat_map = {}
+        for r in rows:
+            code = r.get("fonKodu")
+            val = r.get(chosen_key)
+            if code and val not in (None, ""):
+                cat_map[str(code).strip().upper()] = val
+        return chosen_key, cat_map, None
+    except Exception as e:
+        return None, {}, f"Category probe failed: {e}"
+
+
 def clean_bad_ticks(price_df):
     raw_ret = price_df.pct_change(fill_method=None)
     bad_tick = raw_ret.abs() > MAX_ABS_DAILY_RETURN
@@ -703,9 +789,22 @@ if name_col:
                    .groupby(code_col)[name_col].last().to_dict())
 
 category_map = {}
+category_field_used = None
+category_probe_error = None
 if category_col:
+    # Would only trigger if a future pytefas version adds category to
+    # INFO_FIELDS -- currently 0.4.1 never does, see probe below.
     category_map = (raw.sort_values(date_col).dropna(subset=[category_col])
                         .groupby(code_col)[category_col].last().to_dict())
+    category_field_used = category_col
+else:
+    # Expected path today: fall back to the raw-field probe, since
+    # pytefas's `columns="info"` output has no category field at all
+    # (verified against pytefas/schema.py INFO_FIELDS). See the probe's
+    # own docstring above for exactly what this does and why it's safe.
+    category_field_used, category_map, category_probe_error = probe_raw_category_field(KIND)
+
+have_categories = bool(category_map)
 
 # ── Category filter (sidebar) ───────────────────────────────────────
 # Screener-only "initial filter" condition, same treatment as the max
@@ -716,13 +815,16 @@ if category_col:
 # in the CONFIG section is currently empty); untick anything in the
 # sidebar below to exclude it for the rest of the session.
 EXCLUDED_CATEGORIES = set()
-if category_col:
+if have_categories:
     all_categories = sorted(set(category_map.values()))
     with st.sidebar.expander(f"📂 Fund categories ({len(all_categories)})", expanded=False):
         st.caption("All ticked by default. Untick to exclude a category "
                    "from the Screener (main table, Top-10, inflow/outflow). "
                    "Custom Portfolio below is unaffected -- you can still "
                    "type any ticker directly.")
+        st.caption(f"ℹ️ Detected via raw field `{category_field_used}` "
+                   f"(pytefas doesn't expose fund category directly -- see "
+                   f"code comments on `probe_raw_category_field`).")
         bcol1, bcol2 = st.columns(2)
         if bcol1.button("Select all", key="cat_select_all"):
             for cat in all_categories:
@@ -740,8 +842,9 @@ if category_col:
                 selected_categories.add(cat)
         EXCLUDED_CATEGORIES = set(all_categories) - selected_categories
 else:
-    st.sidebar.caption("ℹ️ No fund-category column detected in this fetch -- "
-                        "category filter unavailable.")
+    st.sidebar.caption("ℹ️ No fund-category field could be detected this fetch -- "
+                        "category filter unavailable."
+                        + (f" ({category_probe_error})" if category_probe_error else ""))
 
 price_df = (raw[[date_col, code_col, price_col]]
             .drop_duplicates(subset=[date_col, code_col], keep="last")
@@ -787,7 +890,7 @@ all_qualified = screen_funds_all(
     price_df, investor_snapshot, LOOKBACK_TDAYS, MIN_HISTORY_TDAYS,
     MIN_ANN_RETURN_PCT / 100.0, MIN_INVESTOR_COUNT, RISK_FREE_RATE,
     max_drawdown_limit_pct=(MAX_DRAWDOWN_LIMIT_PCT if ENABLE_MAX_DRAWDOWN_FILTER else None),
-    category_map=(category_map if category_col else None),
+    category_map=(category_map if have_categories else None),
     excluded_categories=EXCLUDED_CATEGORIES
 )
 results = all_qualified.head(TOP_N).reset_index(drop=True) if not all_qualified.empty else all_qualified
