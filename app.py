@@ -122,7 +122,7 @@ MAX_INTERP_GAP_TDAYS = 5
 FLOW_WINDOWS_TDAYS = [1, 5, 10, 20]
 MONTH_TDAYS = 22   # "last month" convention used in the summary table below
 
-DEFAULT_EXCLUDED_HOUSE_KEYWORDS = "Pusula, Tera, Atlas"
+DEFAULT_EXCLUDED_HOUSE_KEYWORDS = "Pusula, Tera, Atlas, A1, Bulls, Pardus, Hedef"
 # Comma-separated default for the sidebar's investment-house keyword
 # filter -- these three portfolio management companies' funds recently
 # declared default. Matched case-insensitively as a substring against
